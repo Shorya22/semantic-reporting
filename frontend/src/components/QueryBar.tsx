@@ -1,5 +1,5 @@
 import { useState, useRef, KeyboardEvent } from 'react'
-import { Search, Loader2, ChevronRight } from 'lucide-react'
+import { Search, Loader2, ChevronRight, ShieldCheck } from 'lucide-react'
 
 const SUGGESTIONS = [
   'Show total revenue by category with a bar chart',
@@ -63,7 +63,7 @@ export function QueryBar({ onSubmit, isQuerying, disabled }: Props) {
           placeholder={
             disabled
               ? 'Connect to a database first…'
-              : 'Ask anything about your data…  (Enter to run, Shift+Enter for newline)'
+              : 'Ask about your data — read-only · Enter to run, Shift+Enter for newline'
           }
           disabled={disabled || isQuerying}
           rows={1}
@@ -81,6 +81,23 @@ export function QueryBar({ onSubmit, isQuerying, disabled }: Props) {
             <ChevronRight className="w-4 h-4 text-white" aria-hidden="true" />
           )}
         </button>
+      </div>
+
+      {/* Read-only / data-only scope hint — surfaces the guardrail policy
+          so users see at a glance what the assistant will and won't do. */}
+      <div className="flex items-center justify-between mt-1.5 px-1 text-[10px] text-slate-600 select-none">
+        <span className="inline-flex items-center gap-1.5">
+          <ShieldCheck className="w-3 h-3 text-emerald-500/80" aria-hidden="true" />
+          <span>
+            <span className="text-emerald-400/80 font-medium">Read-only</span>
+            <span className="mx-1">·</span>
+            Data analysis only — no writes, deletes, or off-topic requests
+          </span>
+        </span>
+        <span className="hidden sm:block">
+          <kbd className="font-mono text-[9px] bg-slate-900/80 border border-slate-800 rounded px-1 py-0.5">↵</kbd>
+          <span className="ml-1">to run</span>
+        </span>
       </div>
 
       {/* Suggestion dropdown */}

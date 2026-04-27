@@ -47,6 +47,9 @@ interface AppStore {
   isQuerying: boolean
   ollamaModels: ModelOption[]
   activeAnalysisId: string | null
+  /** Abort handle for the in-flight stream. Wired by useAnalysis; consumed
+   * by `stopAnalysis` and the `/stop` slash command. Never persisted. */
+  currentAbort: (() => void) | null
 
   // ---- Pref setters -------------------------------------------------------
   setModel: (m: string) => void
@@ -81,6 +84,14 @@ interface AppStore {
   setAnalysisError: (id: string, error: string) => void
   attachServerIds: (id: string, conversationId: string, messageId?: string | null) => void
   setActiveAnalysis: (id: string | null) => void
+
+  // ---- Stream control -----------------------------------------------------
+  setCurrentAbort: (fn: (() => void) | null) => void
+  stopAnalysis: () => void
+
+  // ---- Synthetic info / error cards (used by slash commands) -------------
+  emitInfoCard:  (title: string, markdown: string) => void
+  emitErrorCard: (title: string, message: string)  => void
 
   // ---- Misc ---------------------------------------------------------------
   setOllamaModels: (models: ModelOption[]) => void
@@ -138,6 +149,7 @@ export const useStore = create<AppStore>()(
       isQuerying: false,
       ollamaModels: [],
       activeAnalysisId: null,
+      currentAbort: null,
 
       // ---- Pref setters ---------------------------------------------------
       setModel:               (model) => set({ model }),
@@ -271,6 +283,78 @@ export const useStore = create<AppStore>()(
         })),
 
       setActiveAnalysis: (id) => set({ activeAnalysisId: id }),
+
+      // ---- Stream control --------------------------------------------------
+
+      setCurrentAbort: (fn) => set({ currentAbort: fn }),
+
+      stopAnalysis: () =>
+        set((st) => {
+          // Trigger the abort if the stream is still live.
+          try { st.currentAbort?.() } catch { /* defensive */ }
+          // Finalise the in-flight analysis as 'done' so the partial answer,
+          // charts and tables stay visible. The user can re-run with /retry.
+          const id = st.activeAnalysisId
+          const analyses = st.analyses.map((a) =>
+            a.id === id && a.status === 'running'
+              ? {
+                  ...a,
+                  status: 'done' as const,
+                  insight: a.insight + (a.insight && !a.insight.endsWith('\n') ? '\n\n' : '') + '_— stopped by user_',
+                }
+              : a,
+          )
+          return {
+            analyses,
+            isQuerying:   false,
+            currentAbort: null,
+          }
+        }),
+
+      // ---- Synthetic cards (slash commands inject results this way) ------
+
+      emitInfoCard: (title, markdown) =>
+        set((st) => {
+          const id = `cmd_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`
+          return {
+            analyses: [
+              ...st.analyses,
+              {
+                id,
+                question:   title,
+                status:     'done',
+                startedAt:  new Date(),
+                insight:    markdown,
+                charts:     [],
+                tables:     [],
+                steps:      [],
+              },
+            ],
+            activeAnalysisId: id,
+          }
+        }),
+
+      emitErrorCard: (title, message) =>
+        set((st) => {
+          const id = `cmd_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`
+          return {
+            analyses: [
+              ...st.analyses,
+              {
+                id,
+                question:  title,
+                status:    'error',
+                startedAt: new Date(),
+                insight:   '',
+                charts:    [],
+                tables:    [],
+                steps:     [],
+                error:     message,
+              },
+            ],
+            activeAnalysisId: id,
+          }
+        }),
 
       setOllamaModels: (ollamaModels) => set({ ollamaModels }),
 

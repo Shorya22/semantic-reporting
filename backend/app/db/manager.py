@@ -34,7 +34,7 @@ from typing import Any, Optional
 
 import pandas as pd
 from langchain_community.utilities import SQLDatabase
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine
 
 from app.cache import cache
@@ -46,6 +46,50 @@ logger = logging.getLogger(__name__)
 
 
 _SCHEMA_CACHE_KEY = "schema:{cid}"
+
+
+# ---------------------------------------------------------------------------
+# DB-level read-only enforcement.
+# This is the LAST line of defence — even if the SQL guard misses something,
+# the engine itself will refuse to execute write statements.
+# ---------------------------------------------------------------------------
+
+# Postgres connect args: forces every transaction on this connection to
+# be READ ONLY. Implemented via the libpq ``options`` parameter, supported
+# by psycopg2.
+_PG_READONLY_CONNECT_ARGS: dict = {
+    "options": "-c default_transaction_read_only=on -c statement_timeout=30000",
+}
+
+
+def _attach_sqlite_readonly(engine: Engine) -> None:
+    """Force every SQLite connection from this engine into read-only mode.
+
+    ``PRAGMA query_only = ON`` is per-connection in SQLite and persists for
+    the connection's lifetime. Once set, every write attempt on that
+    connection raises ``SQLITE_READONLY``.
+
+    For in-memory engines (used by CSV/Excel loaders) we attach this
+    listener *after* loading the data, so the initial ``df.to_sql`` is
+    permitted but every subsequent connection from the SAME engine is
+    locked down. We also mark the existing pooled connection(s) read-only
+    by issuing the PRAGMA on the listener's first miss.
+    """
+    @event.listens_for(engine, "connect")
+    def _on_connect(dbapi_conn, _record):  # noqa: ANN001
+        cur = dbapi_conn.cursor()
+        try:
+            cur.execute("PRAGMA query_only = ON")
+        finally:
+            cur.close()
+
+    # Sweep any connections that were already created before the listener
+    # was attached (e.g. the one used by df.to_sql for CSV loads).
+    try:
+        with engine.connect() as conn:
+            conn.exec_driver_sql("PRAGMA query_only = ON")
+    except Exception:  # pragma: no cover — defensive only
+        pass
 
 
 class ConnectionManager:
@@ -123,6 +167,7 @@ class ConnectionManager:
         abs_path = os.path.abspath(db_path)
         uri = f"sqlite:///{abs_path}"
         db = SQLDatabase.from_uri(uri)
+        _attach_sqlite_readonly(db._engine)  # DB-level read-only safety net
 
         tables = db.get_usable_table_names()
         schema_ddl = db.get_table_info()
@@ -155,7 +200,13 @@ class ConnectionManager:
     ) -> str:
         sid = session_id or str(uuid.uuid4())
         uri = f"postgresql://{user}:{password}@{host}:{port}/{database}"
-        db = SQLDatabase.from_uri(uri)
+        db = SQLDatabase.from_uri(
+            uri,
+            engine_args={
+                "connect_args": _PG_READONLY_CONNECT_ARGS,
+                "pool_pre_ping": True,
+            },
+        )
 
         tables = db.get_usable_table_names()
         schema_ddl = db.get_table_info()
@@ -192,6 +243,7 @@ class ConnectionManager:
         df: pd.DataFrame = pd.read_csv(file_path)
         engine: Engine = create_engine("sqlite://")
         df.to_sql(table_name, engine, if_exists="replace", index=False)
+        _attach_sqlite_readonly(engine)  # lock the engine after the initial load
 
         db = SQLDatabase(engine)
         schema_ddl = db.get_table_info()
@@ -240,6 +292,7 @@ class ConnectionManager:
             t_name = sheet.replace(" ", "_").lower()
             df.to_sql(t_name, engine, if_exists="replace", index=False)
             tables.append(t_name)
+        _attach_sqlite_readonly(engine)  # lock the engine after every sheet is loaded
 
         db = SQLDatabase(engine)
         schema_ddl = db.get_table_info()
@@ -291,6 +344,7 @@ class ConnectionManager:
         try:
             if row_type == "sqlite" and row_path and os.path.exists(row_path):
                 db = SQLDatabase.from_uri(f"sqlite:///{row_path}")
+                _attach_sqlite_readonly(db._engine)
                 tables = db.get_usable_table_names()
                 schema_ddl = db.get_table_info()
                 meta = self._build_metadata(
@@ -302,7 +356,13 @@ class ConnectionManager:
 
             if row_type == "postgresql" and row_host and row_database and row_username:
                 uri = f"postgresql://{row_username}:{password or ''}@{row_host}:{row_port or 5432}/{row_database}"
-                db = SQLDatabase.from_uri(uri)
+                db = SQLDatabase.from_uri(
+                    uri,
+                    engine_args={
+                        "connect_args": _PG_READONLY_CONNECT_ARGS,
+                        "pool_pre_ping": True,
+                    },
+                )
                 tables = db.get_usable_table_names()
                 schema_ddl = db.get_table_info()
                 meta = self._build_metadata(
