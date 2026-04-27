@@ -1,36 +1,72 @@
 import { create } from 'zustand'
+import { persist, createJSONStorage } from 'zustand/middleware'
 import {
   AnalysisResult,
   AgentStep,
   ChartResult,
+  Conversation,
   LlmProvider,
   ModelOption,
+  PersistedMessage,
   Session,
   TableResult,
   TokenUsage,
 } from '../types'
 
+/**
+ * Application state.
+ *
+ * The store is split conceptually:
+ *   * **Persisted slice** — UI prefs that should survive a refresh
+ *     (model, provider, active conversation/session). Stored in
+ *     `localStorage` via zustand `persist` middleware. The server is the
+ *     authoritative source; localStorage just gives us instant UI on
+ *     reload while we re-fetch from the backend.
+ *   * **Ephemeral slice** — the live in-flight analyses, the loaded
+ *     `analyses` list for the current conversation, and the connections
+ *     list. These are hydrated from the backend on mount and re-fetched
+ *     when the user switches conversations.
+ *
+ * Why not persist everything? Because charts/tables can be large, and
+ * server-persisted truth is already perfect — duplicating it in
+ * localStorage would just create a sync nightmare.
+ */
 interface AppStore {
-  // DB sessions
-  sessions: Session[]
-  activeSessionId: string | null
-
-  // Analysis history
-  analyses: AnalysisResult[]
-  activeAnalysisId: string | null
-  isQuerying: boolean
-
-  // Model config
+  // ---- Persisted prefs ----------------------------------------------------
   model: string
   provider: LlmProvider
-  ollamaModels: ModelOption[]
+  activeSessionId: string | null
+  activeConversationId: string | null
 
-  // Session actions
-  addSession: (s: Session) => void
+  // ---- Ephemeral state ----------------------------------------------------
+  hydrated: boolean
+  sessions: Session[]
+  conversations: Conversation[]
+  analyses: AnalysisResult[]
+  isQuerying: boolean
+  ollamaModels: ModelOption[]
+  activeAnalysisId: string | null
+
+  // ---- Pref setters -------------------------------------------------------
+  setModel: (m: string) => void
+  setProvider: (p: LlmProvider) => void
   setActiveSession: (id: string | null) => void
+  setActiveConversation: (id: string | null) => void
+
+  // ---- Hydration ----------------------------------------------------------
+  setHydrated: (h: boolean) => void
+  setSessions: (s: Session[]) => void
+  setConversations: (c: Conversation[]) => void
+  upsertConversation: (c: Conversation) => void
+  removeConversation: (id: string) => void
+
+  // ---- Sessions / connections --------------------------------------------
+  addSession: (s: Session) => void
   removeSession: (id: string) => void
 
-  // Analysis actions
+  // ---- Analyses (current conversation thread) ----------------------------
+  setAnalyses: (a: AnalysisResult[]) => void
+  loadAnalysesFromMessages: (messages: PersistedMessage[]) => void
   startAnalysis: (id: string, question: string) => void
   appendToken: (id: string, token: string) => void
   addChart: (id: string, chart: ChartResult) => void
@@ -40,118 +76,219 @@ interface AppStore {
   setUsage: (id: string, usage: TokenUsage) => void
   finalizeAnalysis: (id: string) => void
   setAnalysisError: (id: string, error: string) => void
+  attachServerIds: (id: string, conversationId: string, messageId?: string | null) => void
   setActiveAnalysis: (id: string | null) => void
 
-  // Model actions
-  setModel: (m: string) => void
-  setProvider: (p: LlmProvider) => void
+  // ---- Misc ---------------------------------------------------------------
   setOllamaModels: (models: ModelOption[]) => void
+  reset: () => void
 }
 
-export const useStore = create<AppStore>((set) => ({
-  sessions: [],
-  activeSessionId: null,
-  analyses: [],
-  activeAnalysisId: null,
-  isQuerying: false,
-  model: 'llama-3.3-70b-versatile',
-  provider: 'groq',
-  ollamaModels: [],
 
-  addSession: (s) =>
-    set((st) => ({
-      sessions: [...st.sessions, s],
-      activeSessionId: s.session_id,
-    })),
+/**
+ * Adapt a persisted assistant message back into our streaming
+ * `AnalysisResult` shape so the UI renders identically whether the run
+ * just completed or was reloaded after a refresh.
+ */
+function messagesToAnalyses(messages: PersistedMessage[]): AnalysisResult[] {
+  const out: AnalysisResult[] = []
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]
+    if (msg.role !== 'assistant') continue
+    const prev = i > 0 ? messages[i - 1] : null
+    const question = prev && prev.role === 'user' ? prev.content : '(question unavailable)'
+    out.push({
+      id: msg.id,
+      question,
+      status: msg.status,
+      startedAt: msg.created_at ? new Date(msg.created_at) : new Date(),
+      insight: msg.content,
+      charts: msg.charts ?? [],
+      tables: msg.tables ?? [],
+      steps:  msg.steps  ?? [],
+      exportSql:       msg.export_sql ?? undefined,
+      usage:           msg.usage ?? undefined,
+      error:           msg.error ?? undefined,
+      conversationId:  msg.conversation_id,
+      messageId:       msg.id,
+    })
+  }
+  return out
+}
 
-  setActiveSession: (id) => set({ activeSessionId: id }),
 
-  removeSession: (id) =>
-    set((st) => ({
-      sessions: st.sessions.filter((x) => x.session_id !== id),
-      activeSessionId: st.activeSessionId === id ? null : st.activeSessionId,
-    })),
+export const useStore = create<AppStore>()(
+  persist(
+    (set) => ({
+      // ---- Persisted defaults ---------------------------------------------
+      model: 'llama-3.3-70b-versatile',
+      provider: 'groq',
+      activeSessionId: null,
+      activeConversationId: null,
 
-  startAnalysis: (id, question) =>
-    set((st) => ({
-      analyses: [
-        ...st.analyses,
-        {
-          id,
-          question,
-          status: 'running',
-          startedAt: new Date(),
-          insight: '',
-          charts: [],
-          tables: [],
-          steps: [],
-        },
-      ],
-      activeAnalysisId: id,
-      isQuerying: true,
-    })),
-
-  appendToken: (id, token) =>
-    set((st) => ({
-      analyses: st.analyses.map((a) =>
-        a.id === id ? { ...a, insight: a.insight + token } : a
-      ),
-    })),
-
-  addChart: (id, chart) =>
-    set((st) => ({
-      analyses: st.analyses.map((a) =>
-        a.id === id ? { ...a, charts: [...a.charts, chart] } : a
-      ),
-    })),
-
-  addTable: (id, table) =>
-    set((st) => ({
-      analyses: st.analyses.map((a) =>
-        a.id === id ? { ...a, tables: [...a.tables, table] } : a
-      ),
-    })),
-
-  addStep: (id, step) =>
-    set((st) => ({
-      analyses: st.analyses.map((a) =>
-        a.id === id ? { ...a, steps: [...a.steps, step] } : a
-      ),
-    })),
-
-  setExportCtx: (id, sql, sessionId) =>
-    set((st) => ({
-      analyses: st.analyses.map((a) =>
-        a.id === id ? { ...a, exportSql: sql, exportSessionId: sessionId } : a
-      ),
-    })),
-
-  setUsage: (id, usage) =>
-    set((st) => ({
-      analyses: st.analyses.map((a) =>
-        a.id === id ? { ...a, usage } : a
-      ),
-    })),
-
-  finalizeAnalysis: (id) =>
-    set((st) => ({
-      analyses: st.analyses.map((a) =>
-        a.id === id ? { ...a, status: 'done' } : a
-      ),
+      // ---- Ephemeral defaults ---------------------------------------------
+      hydrated: false,
+      sessions: [],
+      conversations: [],
+      analyses: [],
       isQuerying: false,
-    })),
+      ollamaModels: [],
+      activeAnalysisId: null,
 
-  setAnalysisError: (id, error) =>
-    set((st) => ({
-      analyses: st.analyses.map((a) =>
-        a.id === id ? { ...a, status: 'error', error } : a
-      ),
-      isQuerying: false,
-    })),
+      // ---- Pref setters ---------------------------------------------------
+      setModel:               (model) => set({ model }),
+      setProvider:            (provider) => set({ provider }),
+      setActiveSession:       (id) => set({ activeSessionId: id }),
+      setActiveConversation:  (id) => set({ activeConversationId: id }),
 
-  setActiveAnalysis: (id) => set({ activeAnalysisId: id }),
+      // ---- Hydration ------------------------------------------------------
+      setHydrated:      (hydrated) => set({ hydrated }),
+      setSessions:      (sessions) => set({ sessions }),
+      setConversations: (conversations) => set({ conversations }),
 
-  setModel: (model) => set({ model }),
-  setProvider: (provider) => set({ provider }),
-  setOllamaModels: (ollamaModels) => set({ ollamaModels }),
-}))
+      upsertConversation: (c) =>
+        set((st) => {
+          const idx = st.conversations.findIndex((x) => x.id === c.id)
+          if (idx === -1) return { conversations: [c, ...st.conversations] }
+          const next = [...st.conversations]
+          next[idx] = { ...next[idx], ...c }
+          return { conversations: next }
+        }),
+
+      removeConversation: (id) =>
+        set((st) => ({
+          conversations:        st.conversations.filter((c) => c.id !== id),
+          activeConversationId: st.activeConversationId === id ? null : st.activeConversationId,
+          analyses:             st.activeConversationId === id ? [] : st.analyses,
+        })),
+
+      // ---- Sessions -------------------------------------------------------
+      addSession: (s) =>
+        set((st) => ({
+          sessions:        st.sessions.some((x) => x.session_id === s.session_id)
+            ? st.sessions.map((x) => (x.session_id === s.session_id ? s : x))
+            : [...st.sessions, s],
+          activeSessionId: s.session_id,
+        })),
+
+      removeSession: (id) =>
+        set((st) => ({
+          sessions:        st.sessions.filter((x) => x.session_id !== id),
+          activeSessionId: st.activeSessionId === id ? null : st.activeSessionId,
+        })),
+
+      // ---- Analyses -------------------------------------------------------
+      setAnalyses:    (analyses) => set({ analyses }),
+      loadAnalysesFromMessages: (messages) =>
+        set({ analyses: messagesToAnalyses(messages) }),
+
+      startAnalysis: (id, question) =>
+        set((st) => ({
+          analyses: [
+            ...st.analyses,
+            {
+              id,
+              question,
+              status:    'running',
+              startedAt: new Date(),
+              insight:   '',
+              charts:    [],
+              tables:    [],
+              steps:     [],
+            },
+          ],
+          activeAnalysisId: id,
+          isQuerying:       true,
+        })),
+
+      appendToken: (id, token) =>
+        set((st) => ({
+          analyses: st.analyses.map((a) =>
+            a.id === id ? { ...a, insight: a.insight + token } : a,
+          ),
+        })),
+
+      addChart: (id, chart) =>
+        set((st) => ({
+          analyses: st.analyses.map((a) =>
+            a.id === id ? { ...a, charts: [...a.charts, chart] } : a,
+          ),
+        })),
+
+      addTable: (id, table) =>
+        set((st) => ({
+          analyses: st.analyses.map((a) =>
+            a.id === id ? { ...a, tables: [...a.tables, table] } : a,
+          ),
+        })),
+
+      addStep: (id, step) =>
+        set((st) => ({
+          analyses: st.analyses.map((a) =>
+            a.id === id ? { ...a, steps: [...a.steps, step] } : a,
+          ),
+        })),
+
+      setExportCtx: (id, sql, sessionId) =>
+        set((st) => ({
+          analyses: st.analyses.map((a) =>
+            a.id === id ? { ...a, exportSql: sql, exportSessionId: sessionId } : a,
+          ),
+        })),
+
+      setUsage: (id, usage) =>
+        set((st) => ({
+          analyses: st.analyses.map((a) => (a.id === id ? { ...a, usage } : a)),
+        })),
+
+      finalizeAnalysis: (id) =>
+        set((st) => ({
+          analyses:   st.analyses.map((a) => (a.id === id ? { ...a, status: 'done' } : a)),
+          isQuerying: false,
+        })),
+
+      setAnalysisError: (id, error) =>
+        set((st) => ({
+          analyses:   st.analyses.map((a) =>
+            a.id === id ? { ...a, status: 'error', error } : a,
+          ),
+          isQuerying: false,
+        })),
+
+      attachServerIds: (id, conversationId, messageId) =>
+        set((st) => ({
+          analyses: st.analyses.map((a) =>
+            a.id === id
+              ? { ...a, conversationId, messageId: messageId ?? a.messageId }
+              : a,
+          ),
+        })),
+
+      setActiveAnalysis: (id) => set({ activeAnalysisId: id }),
+
+      setOllamaModels: (ollamaModels) => set({ ollamaModels }),
+
+      reset: () =>
+        set({
+          analyses:             [],
+          activeAnalysisId:     null,
+          isQuerying:           false,
+        }),
+    }),
+
+    // ----- persist config -----------------------------------------------
+    {
+      name: 'datalens-ai-state',
+      version: 1,
+      storage: createJSONStorage(() => localStorage),
+      // Only persist the prefs slice — never persist big payloads or
+      // session/conversation lists; those are fetched from the server.
+      partialize: (s) => ({
+        model:                s.model,
+        provider:             s.provider,
+        activeSessionId:      s.activeSessionId,
+        activeConversationId: s.activeConversationId,
+      }),
+    },
+  ),
+)

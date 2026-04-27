@@ -1,0 +1,1014 @@
+"""
+FastAPI route definitions for the DataLens AI API.
+
+All routes are mounted under the ``/api/v1`` prefix (configured here on the
+APIRouter). Handlers follow the thin-controller pattern: validate → delegate
+→ respond. Business logic lives in ``app.db.manager`` (connection management)
+and ``app.agents.sql_agent`` (LangGraph agent execution).
+
+Tag groupings (drive the section ordering in ``/docs``):
+  * **Meta**           – /config
+  * **Models**         – /ollama/models
+  * **Connections**    – /connections/*
+  * **Query**          – /query, /query/stream
+  * **Visualization**  – /visualize
+  * **Exports**        – /export/{csv,excel,pdf}
+"""
+
+import asyncio
+import json
+import os
+import urllib.error
+import urllib.request
+import uuid
+from typing import AsyncGenerator
+
+from fastapi import APIRouter, HTTPException, UploadFile, File
+from fastapi.responses import Response, StreamingResponse
+import aiofiles
+
+from app.agents.sql_agent import evict_session_agents, run_query, stream_query
+from app.api.schemas import (
+    ApiResponse,
+    ChartRequest,
+    ExportRequest,
+    PostgresConnectRequest,
+    QueryRequest,
+    SQLiteConnectRequest,
+)
+from app.cache import cache
+from app.config import settings
+from app.db.manager import connection_manager
+from app.security.sql_guard import validate_read_only
+from app.services.conversation_service import (
+    append_assistant_message,
+    append_user_message,
+    get_or_create_conversation,
+    new_message_id,
+)
+
+router = APIRouter(prefix="/api/v1")
+
+
+_OLLAMA_MODELS_KEY = "ollama:models"
+
+
+# =============================================================================
+# Reusable response examples
+# =============================================================================
+
+ERR_404_SESSION = {
+    "description": "Session not found.",
+    "content": {
+        "application/json": {
+            "example": {"detail": "Session 'b3f0…' not found.  Connect to a database first."}
+        }
+    },
+}
+
+ERR_400_BAD_SQL = {
+    "description": "SQL was rejected (write/DDL operation, multi-statement, or invalid SQL).",
+    "content": {
+        "application/json": {
+            "example": {
+                "detail": (
+                    "SQL contains a blocked operation (Update). "
+                    "Only read operations are permitted (SELECT, UNION, EXPLAIN, SHOW, DESCRIBE, PRAGMA)."
+                )
+            }
+        }
+    },
+}
+
+ERR_422_VALIDATION = {
+    "description": "Pydantic validation error — body is missing required fields or has wrong types.",
+    "content": {
+        "application/json": {
+            "example": {
+                "detail": [
+                    {
+                        "type":  "string_type",
+                        "loc":   ["body", "session_id"],
+                        "msg":   "Input should be a valid string",
+                        "input": None,
+                    }
+                ]
+            }
+        }
+    },
+}
+
+
+# =============================================================================
+# Meta
+# =============================================================================
+
+
+@router.get(
+    "/config",
+    tags=["Meta"],
+    response_model=ApiResponse,
+    summary="Server configuration",
+    description=(
+        "Returns the runtime configuration the frontend needs to render the model "
+        "picker and the provider toggle."
+    ),
+    responses={
+        200: {
+            "description": "Configuration returned.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "data": {
+                            "default_model":   "llama-3.3-70b-versatile",
+                            "llm_provider":    "groq",
+                            "ollama_base_url": "http://localhost:11434",
+                        },
+                        "error": None,
+                    }
+                }
+            },
+        }
+    },
+)
+def get_config() -> dict:
+    """Return public server configuration."""
+    return {
+        "data": {
+            "default_model":   settings.default_model,
+            "llm_provider":    settings.llm_provider,
+            "ollama_base_url": settings.ollama_base_url,
+        },
+        "error": None,
+    }
+
+
+# =============================================================================
+# Models (Ollama discovery)
+# =============================================================================
+
+
+@router.get(
+    "/ollama/models",
+    tags=["Models"],
+    response_model=ApiResponse,
+    summary="List Ollama models",
+    description=(
+        "Queries the local Ollama server (`OLLAMA_BASE_URL`) and returns the list of "
+        "downloaded models. Cached for `CACHE_OLLAMA_TTL` seconds (default 60s) so the "
+        "model picker can poll cheaply."
+    ),
+    responses={
+        200: {
+            "description": "Ollama is reachable; model list returned.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "data": [
+                            {"id": "llama3.2:latest",      "label": "llama3.2:latest"},
+                            {"id": "qwen2.5-coder:7b",     "label": "qwen2.5-coder:7b"},
+                            {"id": "mistral:7b-instruct",  "label": "mistral:7b-instruct"},
+                        ],
+                        "error": None,
+                    }
+                }
+            },
+        },
+        503: {
+            "description": "Ollama not reachable at the configured base URL.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": "Ollama not reachable at http://localhost:11434: Connection refused"
+                    }
+                }
+            },
+        },
+    },
+)
+async def get_ollama_models() -> dict:
+    """Fetch the model list from the Ollama server, cached for short TTL."""
+    cached = await cache.aget(_OLLAMA_MODELS_KEY)
+    if cached is not None:
+        return {"data": cached, "error": None}
+
+    def _fetch() -> list:
+        url = f"{settings.ollama_base_url}/api/tags"
+        with urllib.request.urlopen(url, timeout=5) as resp:  # noqa: S310
+            data = json.loads(resp.read())
+        return [{"id": m["name"], "label": m["name"]} for m in data.get("models", [])]
+
+    try:
+        models = await asyncio.get_event_loop().run_in_executor(None, _fetch)
+        await cache.aset(_OLLAMA_MODELS_KEY, models, ttl=settings.cache_ollama_ttl)
+        return {"data": models, "error": None}
+    except Exception as exc:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Ollama not reachable at {settings.ollama_base_url}: {str(exc)[:200]}",
+        ) from exc
+
+
+# =============================================================================
+# Connections
+# =============================================================================
+
+
+@router.post(
+    "/connections/sqlite",
+    tags=["Connections"],
+    response_model=ApiResponse,
+    status_code=200,
+    summary="Connect to a SQLite database",
+    description=(
+        "Opens a SQLAlchemy connection to a local `.db` / `.sqlite` file and registers "
+        "a session. The returned `session_id` is required for every subsequent query, "
+        "visualisation, or export request."
+    ),
+    responses={
+        200: {
+            "description": "Connection opened.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "data": {
+                            "session_id": "8f3c1b2a-9e6d-4d8f-9c45-1b9a7e3f0c12",
+                            "type":       "sqlite",
+                            "path":       "D:/semantic-reporting/backend/expenses.db",
+                            "name":       "expenses.db",
+                            "tables":     ["transactions", "categories", "accounts"],
+                            "schema_ddl": "CREATE TABLE transactions ( ... );",
+                        },
+                        "error": None,
+                    }
+                }
+            },
+        },
+        400: {
+            "description": "SQLAlchemy could not open the file (wrong format, locked, etc.).",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "file is not a database"}
+                }
+            },
+        },
+        404: {
+            "description": "File does not exist at the given path.",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "SQLite file not found: D:/missing.db"}
+                }
+            },
+        },
+        422: ERR_422_VALIDATION,
+    },
+)
+def connect_sqlite(req: SQLiteConnectRequest) -> dict:
+    """Open a connection to a SQLite database file."""
+    if not os.path.exists(req.db_path):
+        raise HTTPException(
+            status_code=404,
+            detail=f"SQLite file not found: {req.db_path}",
+        )
+    try:
+        session_id = connection_manager.connect_sqlite(req.db_path, req.session_id)
+        meta = connection_manager.get_metadata(session_id)
+        return {"data": {"session_id": session_id, **meta}, "error": None}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/connections/postgres",
+    tags=["Connections"],
+    response_model=ApiResponse,
+    status_code=200,
+    summary="Connect to a PostgreSQL database",
+    description=(
+        "Opens a SQLAlchemy connection to a remote PostgreSQL database. The credentials "
+        "are used to build a connection URI of the form "
+        "`postgresql://<user>:<password>@<host>:<port>/<database>`."
+    ),
+    responses={
+        200: {
+            "description": "Connection opened.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "data": {
+                            "session_id": "2d4e6c8a-1f3b-4a5e-9c7d-0b8e2a6f4d10",
+                            "type":       "postgresql",
+                            "host":       "localhost",
+                            "port":       5432,
+                            "database":   "sales_db",
+                            "name":       "sales_db",
+                            "tables":     ["customers", "orders", "products"],
+                            "schema_ddl": "CREATE TABLE customers ( ... );",
+                        },
+                        "error": None,
+                    }
+                }
+            },
+        },
+        400: {
+            "description": "Connection failed (bad credentials, unreachable host, etc.).",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": (
+                            "(psycopg2.OperationalError) FATAL:  password authentication failed for user \"postgres\""
+                        )
+                    }
+                }
+            },
+        },
+        422: ERR_422_VALIDATION,
+    },
+)
+def connect_postgres(req: PostgresConnectRequest) -> dict:
+    """Open a connection to a PostgreSQL database."""
+    try:
+        session_id = connection_manager.connect_postgres(
+            req.host, req.port, req.database, req.user, req.password, req.session_id
+        )
+        meta = connection_manager.get_metadata(session_id)
+        return {"data": {"session_id": session_id, **meta}, "error": None}
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post(
+    "/connections/upload",
+    tags=["Connections"],
+    response_model=ApiResponse,
+    status_code=200,
+    summary="Upload a CSV or Excel file",
+    description=(
+        "Accepts a `multipart/form-data` upload of a `.csv`, `.xlsx`, or `.xls` file. "
+        "The file is parsed with pandas and inserted into a brand-new in-memory SQLite "
+        "database so the SQL agent can query it.\n\n"
+        "* CSV → 1 table named after the file stem\n"
+        "* Excel → 1 table per sheet (sheet name lowercased, spaces → `_`)\n\n"
+        "The in-memory engine is held open for the lifetime of the session — closing "
+        "the session releases the memory."
+    ),
+    responses={
+        200: {
+            "description": "File parsed and session created.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "data": {
+                            "session_id": "f0a8e4b2-9c7d-4f3e-8b2a-1d5c7f9e0b34",
+                            "type":       "csv",
+                            "file":       "expenses.csv",
+                            "name":       "expenses.csv",
+                            "table":      "expenses",
+                            "rows":       1547,
+                            "columns":    ["id", "category", "amount", "date"],
+                            "tables":     ["expenses"],
+                            "schema_ddl": "CREATE TABLE expenses ( ... );",
+                        },
+                        "error": None,
+                    }
+                }
+            },
+        },
+        400: {
+            "description": "Unsupported extension or pandas could not parse the file.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "detail": "Unsupported file type '.txt'.  Only .csv, .xlsx, and .xls are accepted."
+                    }
+                }
+            },
+        },
+    },
+)
+async def upload_file(
+    file: UploadFile = File(..., description="CSV (.csv) or Excel (.xlsx / .xls) file."),
+) -> dict:
+    """Upload a CSV or Excel file and create an in-memory database session."""
+    filename: str = file.filename or "upload"
+    ext: str = os.path.splitext(filename)[1].lower()
+
+    if ext not in (".csv", ".xlsx", ".xls"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type '{ext}'.  Only .csv, .xlsx, and .xls are accepted.",
+        )
+
+    save_path = os.path.join(settings.upload_dir, f"{uuid.uuid4()}_{filename}")
+    try:
+        async with aiofiles.open(save_path, "wb") as fp:
+            await fp.write(await file.read())
+
+        if ext == ".csv":
+            session_id = connection_manager.load_csv(save_path)
+        else:
+            session_id = connection_manager.load_excel(save_path)
+
+        meta = connection_manager.get_metadata(session_id)
+        return {"data": {"session_id": session_id, **meta}, "error": None}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.get(
+    "/connections",
+    tags=["Connections"],
+    response_model=ApiResponse,
+    summary="List active database sessions",
+    description="Returns metadata for every currently active in-memory session.",
+    responses={
+        200: {
+            "description": "List of active sessions (may be empty).",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "data": [
+                            {
+                                "session_id": "8f3c1b2a-9e6d-4d8f-9c45-1b9a7e3f0c12",
+                                "type":       "sqlite",
+                                "name":       "expenses.db",
+                                "tables":     ["transactions", "categories"],
+                            }
+                        ],
+                        "error": None,
+                    }
+                }
+            },
+        }
+    },
+)
+def list_connections() -> dict:
+    """Return metadata for all active sessions."""
+    return {"data": connection_manager.list_sessions(), "error": None}
+
+
+@router.get(
+    "/connections/{session_id}",
+    tags=["Connections"],
+    response_model=ApiResponse,
+    summary="Get session metadata",
+    description="Returns connection metadata (type, name, tables, schema DDL) for a single session.",
+    responses={
+        200: {
+            "description": "Session found.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "data": {
+                            "session_id": "8f3c1b2a-9e6d-4d8f-9c45-1b9a7e3f0c12",
+                            "type":       "sqlite",
+                            "name":       "expenses.db",
+                            "tables":     ["transactions", "categories"],
+                            "schema_ddl": "CREATE TABLE transactions ( ... );",
+                        },
+                        "error": None,
+                    }
+                }
+            },
+        },
+        404: ERR_404_SESSION,
+    },
+)
+def get_connection(session_id: str) -> dict:
+    """Retrieve metadata for a specific active session."""
+    if not connection_manager.is_connected(session_id):
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+    meta = connection_manager.get_metadata(session_id)
+    return {"data": {"session_id": session_id, **meta}, "error": None}
+
+
+@router.delete(
+    "/connections/{session_id}",
+    tags=["Connections"],
+    response_model=ApiResponse,
+    summary="Close a session",
+    description=(
+        "Disconnects and removes the session from the in-memory registry. For CSV/Excel "
+        "sessions this releases the underlying in-memory SQLite engine. The agent graph "
+        "cache for this session is also evicted."
+    ),
+    responses={
+        200: {
+            "description": "Session closed.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "data": {"message": "Session disconnected successfully."},
+                        "error": None,
+                    }
+                }
+            },
+        },
+        404: ERR_404_SESSION,
+    },
+)
+def disconnect(session_id: str) -> dict:
+    """Close an active session."""
+    if not connection_manager.is_connected(session_id):
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+    evict_session_agents(session_id)
+    connection_manager.disconnect(session_id)
+    return {"data": {"message": "Session disconnected successfully."}, "error": None}
+
+
+@router.get(
+    "/connections/{session_id}/tables",
+    tags=["Connections"],
+    response_model=ApiResponse,
+    summary="List tables in a session",
+    description="Returns the names of all usable tables in the connected database.",
+    responses={
+        200: {
+            "description": "Table names returned.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "data": ["transactions", "categories", "accounts"],
+                        "error": None,
+                    }
+                }
+            },
+        },
+        404: ERR_404_SESSION,
+    },
+)
+def get_tables(session_id: str) -> dict:
+    """List table names for an active session."""
+    if not connection_manager.is_connected(session_id):
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+    return {"data": connection_manager.get_tables(session_id), "error": None}
+
+
+# =============================================================================
+# Query
+# =============================================================================
+
+
+@router.post(
+    "/query",
+    tags=["Query"],
+    response_model=ApiResponse,
+    summary="Run a NL query (blocking)",
+    description=(
+        "Sends the question to the LangGraph SQL agent and **waits** for the full "
+        "response. Returns the final answer, the list of reasoning/tool steps, and the "
+        "token-usage summary.\n\n"
+        "Use `POST /query/stream` for token-by-token streaming via Server-Sent Events."
+    ),
+    responses={
+        200: {
+            "description": "Query completed.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "data": {
+                            "session_id": "8f3c1b2a-9e6d-4d8f-9c45-1b9a7e3f0c12",
+                            "answer": (
+                                "The top 5 categories are Groceries ($12,400.50), "
+                                "Rent ($9,800.00), Transport ($4,250.75), "
+                                "Dining ($3,100.10), and Utilities ($2,890.40)."
+                            ),
+                            "steps": [
+                                {
+                                    "type":  "tool_call",
+                                    "tool":  "execute_sql",
+                                    "input": "{'sql': 'SELECT category, SUM(amount) AS total ...'}",
+                                },
+                                {
+                                    "type":   "tool_result",
+                                    "tool":   "execute_sql",
+                                    "output": "category | total\\nGroceries | 12400.50 ...",
+                                },
+                            ],
+                            "usage": {
+                                "input_tokens":  2341,
+                                "output_tokens": 187,
+                                "total_tokens":  2528,
+                                "latency_ms":    4823,
+                            },
+                        },
+                        "error": None,
+                    }
+                }
+            },
+        },
+        404: ERR_404_SESSION,
+        422: ERR_422_VALIDATION,
+        500: {
+            "description": "Agent raised an unexpected error during execution.",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Daily token quota exhausted on Groq. ..."}
+                }
+            },
+        },
+    },
+)
+async def query(req: QueryRequest) -> dict:
+    """Execute a natural-language query and return the full result."""
+    if not connection_manager.is_connected(req.session_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Session '{req.session_id}' not found.  Connect to a database first.",
+        )
+    db = connection_manager.get_db(req.session_id)
+    meta = connection_manager.get_metadata(req.session_id)
+    schema_ddl: str | None = meta.get("schema_ddl") if meta else None
+    try:
+        result = await run_query(
+            db, req.question, req.model, req.provider,
+            session_id=req.session_id, schema_ddl=schema_ddl,
+        )
+        return {
+            "data": {
+                "session_id": req.session_id,
+                "answer":     result["answer"],
+                "steps":      result["steps"],
+                "usage":      result.get("usage"),
+            },
+            "error": None,
+        }
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
+
+
+@router.post(
+    "/query/stream",
+    tags=["Query"],
+    summary="Run a NL query (Server-Sent Events)",
+    description=(
+        "Streams the agent response as `text/event-stream`. Each line is `data: <json>\\n\\n`. "
+        "When `conversation_id` is supplied (or auto-created), the user prompt and "
+        "assistant reply are persisted to the conversation thread.\n\n"
+        "### Event types\n"
+        "| `type` | Meaning |\n"
+        "|---|---|\n"
+        "| `conversation` | First event; carries the resolved conversation + message IDs |\n"
+        "| `token`        | A partial token of the final answer — concatenate to render |\n"
+        "| `tool_start`   | The agent is about to call a tool (`execute_sql` or `generate_chart`) |\n"
+        "| `tool_end`     | A tool returned; `output` is the truncated stringified result |\n"
+        "| `chart_spec`   | An ECharts JSON option object — render with `echarts-for-react` |\n"
+        "| `table_data`   | A structured query result `{columns, rows, sql, title}` |\n"
+        "| `export_ctx`   | Last SQL + session_id — enable CSV/Excel/PDF download buttons |\n"
+        "| `usage`        | `{input_tokens, output_tokens, total_tokens, latency_ms}` |\n"
+        "| `done`         | Stream is complete |\n"
+        "| `error`        | Something went wrong — `content` holds the message |\n\n"
+        "### Example stream (truncated)\n"
+        "```\n"
+        "data: {\"type\":\"conversation\",\"conversation_id\":\"c-1\",\"assistant_message_id\":\"m-2\"}\n\n"
+        "data: {\"type\":\"tool_start\",\"tool\":\"execute_sql\",\"input\":\"sql=SELECT ...\"}\n\n"
+        "data: {\"type\":\"tool_end\",\"tool\":\"execute_sql\",\"output\":\"category | total ...\"}\n\n"
+        "data: {\"type\":\"token\",\"content\":\"The top \"}\n\n"
+        "data: {\"type\":\"token\",\"content\":\"5 categories ...\"}\n\n"
+        "data: {\"type\":\"usage\",\"input_tokens\":2341,\"output_tokens\":187,\"total_tokens\":2528,\"latency_ms\":4823}\n\n"
+        "data: {\"type\":\"done\"}\n\n"
+        "```"
+    ),
+    responses={
+        200: {
+            "description": "SSE stream opened.",
+            "content": {
+                "text/event-stream": {
+                    "schema": {"type": "string"},
+                    "example": (
+                        "data: {\"type\":\"token\",\"content\":\"Hello\"}\n\n"
+                        "data: {\"type\":\"token\",\"content\":\"!\"}\n\n"
+                        "data: {\"type\":\"done\"}\n\n"
+                    ),
+                }
+            },
+        },
+        404: ERR_404_SESSION,
+        422: ERR_422_VALIDATION,
+    },
+)
+async def query_stream(req: QueryRequest) -> StreamingResponse:
+    """Stream a NL query response via SSE, persisting both user + assistant turns."""
+    if not connection_manager.is_connected(req.session_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Session '{req.session_id}' not found.",
+        )
+
+    db = connection_manager.get_db(req.session_id)
+    meta = connection_manager.get_metadata(req.session_id)
+    schema_ddl: str | None = meta.get("schema_ddl") if meta else None
+
+    conversation = get_or_create_conversation(
+        conversation_id=req.conversation_id,
+        question=req.question,
+        connection_id=req.session_id,
+        model=req.model,
+        provider=req.provider,
+    )
+    conversation_id = conversation["id"] if conversation else None
+
+    user_message: dict | None = None
+    assistant_message_id = new_message_id()
+    if conversation_id:
+        user_message = append_user_message(
+            conversation_id=conversation_id,
+            question=req.question,
+        )
+
+    async def event_generator() -> AsyncGenerator[str, None]:
+        answer_parts: list[str] = []
+        charts: list[dict] = []
+        tables: list[dict] = []
+        steps: list[dict] = []
+        usage: dict | None = None
+        export_sql: str | None = None
+        error_msg: str | None = None
+
+        try:
+            if conversation_id:
+                yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id, 'user_message_id': (user_message or {}).get('id'), 'assistant_message_id': assistant_message_id, 'title': conversation.get('title') if conversation else None})}\n\n"
+
+            async for event in stream_query(
+                db, req.question, req.model, req.provider,
+                session_id=req.session_id, schema_ddl=schema_ddl,
+            ):
+                etype = event.get("type")
+                if etype == "token":
+                    answer_parts.append(event.get("content", ""))
+                elif etype == "chart_spec":
+                    charts.append({
+                        "id":     event.get("id", ""),
+                        "option": event.get("option", {}),
+                        "title":  event.get("title", ""),
+                        "sql":    event.get("sql", ""),
+                    })
+                elif etype == "table_data":
+                    tables.append({
+                        "id":      event.get("id", ""),
+                        "columns": event.get("columns", []),
+                        "rows":    event.get("rows", []),
+                        "sql":     event.get("sql", ""),
+                        "title":   event.get("title", "Query Result"),
+                    })
+                elif etype in ("tool_start", "tool_end"):
+                    steps.append({
+                        "type":   etype,
+                        "tool":   event.get("tool"),
+                        "input":  event.get("input"),
+                        "output": event.get("output"),
+                    })
+                elif etype == "export_ctx":
+                    export_sql = event.get("sql") or export_sql
+                elif etype == "usage":
+                    usage = {
+                        "input_tokens":  event.get("input_tokens", 0),
+                        "output_tokens": event.get("output_tokens", 0),
+                        "total_tokens":  event.get("total_tokens", 0),
+                        "latency_ms":    event.get("latency_ms", 0),
+                    }
+
+                yield f"data: {json.dumps(event)}\n\n"
+
+            yield f"data: {json.dumps({'type': 'done'})}\n\n"
+
+        except Exception as exc:  # noqa: BLE001
+            first_line = str(exc).splitlines()[0][:200]
+            error_msg = first_line
+            yield f"data: {json.dumps({'type': 'error', 'content': first_line})}\n\n"
+
+        finally:
+            if conversation_id:
+                try:
+                    append_assistant_message(
+                        conversation_id=conversation_id,
+                        answer="".join(answer_parts),
+                        charts=charts,
+                        tables=tables,
+                        steps=steps,
+                        usage=usage,
+                        export_sql=export_sql,
+                        status="error" if error_msg else "done",
+                        error=error_msg,
+                        message_id=assistant_message_id,
+                    )
+                except Exception:  # noqa: BLE001
+                    pass
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# =============================================================================
+# Visualization
+# =============================================================================
+
+
+@router.post(
+    "/visualize",
+    tags=["Visualization"],
+    response_model=ApiResponse,
+    summary="Render a chart from SQL",
+    description=(
+        "Runs the given SQL `SELECT` and renders a Plotly chart server-side using the "
+        "provided spec. Returns a base64-encoded PNG that can be embedded in an "
+        "`<img>` tag or in an Excel/PDF export.\n\n"
+        "**Supported chart types** (in `chart_spec.chart_type`): `bar`, `horizontal_bar`, "
+        "`line`, `area`, `scatter`, `pie`, `donut`, `histogram`, `heatmap`, `treemap`, "
+        "`funnel`, `box`, `violin`, `bubble`, `waterfall`, `gauge`, `indicator`."
+    ),
+    responses={
+        200: {
+            "description": "Chart rendered.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "data": {
+                            "chart_b64": "iVBORw0KGgoAAAANSUhEUgAA…",
+                            "columns":   ["category", "total"],
+                            "row_count": 5,
+                        },
+                        "error": None,
+                    }
+                }
+            },
+        },
+        400: ERR_400_BAD_SQL,
+        404: ERR_404_SESSION,
+        500: {
+            "description": "Renderer failed (Plotly/Kaleido error).",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Render error: Kaleido subprocess failed"}
+                }
+            },
+        },
+    },
+)
+async def visualize(req: ChartRequest) -> dict:
+    """Execute SQL then render a Plotly PNG chart, base64-encoded."""
+    if not connection_manager.is_connected(req.session_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Session '{req.session_id}' not found.",
+        )
+
+    try:
+        validate_read_only(req.sql)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    db = connection_manager.get_db(req.session_id)
+    try:
+        from sqlalchemy import text as sa_text
+        with db._engine.connect() as conn:
+            result  = conn.execute(sa_text(req.sql))
+            columns = list(result.keys())
+            rows    = [list(r) for r in result.fetchall()]
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"SQL error: {str(exc)[:300]}") from exc
+
+    try:
+        from app.services.viz_service import render_chart, spec_from_dict
+        spec  = spec_from_dict(req.chart_spec)
+        loop  = asyncio.get_event_loop()
+        b64   = await loop.run_in_executor(
+            None,
+            lambda: render_chart(spec, rows, columns, req.width, req.height),
+        )
+        return {"data": {"chart_b64": b64, "columns": columns, "row_count": len(rows)}, "error": None}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Render error: {str(exc)[:300]}") from exc
+
+
+# =============================================================================
+# Exports
+# =============================================================================
+
+def _execute_export_sql(session_id: str, sql: str) -> tuple[list, list[str]]:
+    """Re-run SQL for export; returns (rows, columns).  Raises HTTPException on failure."""
+    if not connection_manager.is_connected(session_id):
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+    try:
+        validate_read_only(sql)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    db = connection_manager.get_db(session_id)
+    try:
+        from sqlalchemy import text as sa_text
+        with db._engine.connect() as conn:
+            result  = conn.execute(sa_text(sql))
+            columns = list(result.keys())
+            rows    = [list(r) for r in result.fetchall()]
+        return rows, columns
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"SQL error: {str(exc)[:300]}") from exc
+
+
+_EXPORT_RESPONSES: dict = {
+    400: ERR_400_BAD_SQL,
+    404: ERR_404_SESSION,
+}
+
+
+@router.post(
+    "/export/csv",
+    tags=["Exports"],
+    summary="Export query results as CSV",
+    description="Re-runs the given SQL and returns a UTF-8 CSV file as a `Content-Disposition: attachment` download.",
+    responses={
+        200: {
+            "description": "CSV file returned.",
+            "content": {
+                "text/csv": {
+                    "schema":  {"type": "string", "format": "binary"},
+                    "example": "category,total\\nGroceries,12400.50\\nRent,9800.00\\n",
+                }
+            },
+        },
+        **_EXPORT_RESPONSES,
+    },
+)
+async def export_csv(req: ExportRequest) -> Response:
+    rows, columns = _execute_export_sql(req.session_id, req.sql)
+    from app.services.export_service import export_csv as _csv
+    data = await asyncio.get_event_loop().run_in_executor(None, lambda: _csv(rows, columns))
+    return Response(
+        content=data,
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{req.title}.csv"'},
+    )
+
+
+@router.post(
+    "/export/excel",
+    tags=["Exports"],
+    summary="Export query results as Excel (.xlsx)",
+    description=(
+        "Re-runs the SQL and returns a styled Excel workbook. If `chart_b64` is "
+        "supplied, the PNG is embedded on a second sheet."
+    ),
+    responses={
+        200: {
+            "description": "XLSX workbook returned.",
+            "content": {
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {
+                    "schema": {"type": "string", "format": "binary"},
+                }
+            },
+        },
+        **_EXPORT_RESPONSES,
+    },
+)
+async def export_excel(req: ExportRequest) -> Response:
+    rows, columns = _execute_export_sql(req.session_id, req.sql)
+    from app.services.export_service import export_excel as _excel
+    data = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: _excel(rows, columns, chart_b64=req.chart_b64, chart_title=req.title),
+    )
+    return Response(
+        content=data,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{req.title}.xlsx"'},
+    )
+
+
+@router.post(
+    "/export/pdf",
+    tags=["Exports"],
+    summary="Export query results as PDF",
+    description=(
+        "Re-runs the SQL and returns a landscape-A4 PDF report (data table + optional "
+        "embedded chart on a second page when `chart_b64` is supplied)."
+    ),
+    responses={
+        200: {
+            "description": "PDF returned.",
+            "content": {
+                "application/pdf": {
+                    "schema": {"type": "string", "format": "binary"},
+                }
+            },
+        },
+        **_EXPORT_RESPONSES,
+    },
+)
+async def export_pdf(req: ExportRequest) -> Response:
+    rows, columns = _execute_export_sql(req.session_id, req.sql)
+    from app.services.export_service import export_pdf as _pdf
+    data = await asyncio.get_event_loop().run_in_executor(
+        None,
+        lambda: _pdf(rows, columns, title=req.title, chart_b64=req.chart_b64),
+    )
+    return Response(
+        content=data,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{req.title}.pdf"'},
+    )

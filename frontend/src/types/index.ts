@@ -26,6 +26,7 @@ export interface TokenUsage {
   input_tokens: number
   output_tokens: number
   total_tokens: number
+  latency_ms?: number
 }
 
 export interface ChartResult {
@@ -58,6 +59,45 @@ export interface AnalysisResult {
   exportSessionId?: string
   usage?: TokenUsage
   error?: string
+
+  // Server-side identifiers once the conversation/persistence flow links them.
+  // Used to reconcile streamed runs with persisted messages on reload.
+  conversationId?: string
+  messageId?: string
+}
+
+export interface Conversation {
+  id: string
+  title: string
+  connection_id: string | null
+  model: string | null
+  provider: string | null
+  created_at: string | null
+  updated_at: string | null
+  message_count: number
+}
+
+export interface PersistedMessage {
+  id: string
+  conversation_id: string
+  role: 'user' | 'assistant'
+  content: string
+  charts: ChartResult[]
+  tables: TableResult[]
+  steps: AgentStep[]
+  usage?: TokenUsage | null
+  export_sql?: string | null
+  status: 'running' | 'done' | 'error'
+  error?: string | null
+  created_at: string | null
+}
+
+export interface UserPreferences {
+  model: string | null
+  provider: LlmProvider | null
+  active_connection_id: string | null
+  active_conversation_id: string | null
+  updated_at?: string | null
 }
 
 export interface ModelOption {

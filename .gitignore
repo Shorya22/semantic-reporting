@@ -13,6 +13,7 @@ build/
 # Environment — NEVER commit secrets
 .env
 !.env.example
+**/.secret_key
 
 # Databases & uploads
 *.db

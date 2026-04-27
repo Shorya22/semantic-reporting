@@ -22,6 +22,14 @@ export function InsightPanel({ content, isStreaming, usage }: Props) {
         {usage && (
           <span className="text-xs text-slate-600">
             ↑{usage.input_tokens.toLocaleString()} ↓{usage.output_tokens.toLocaleString()} tok
+            {typeof usage.latency_ms === 'number' && usage.latency_ms > 0 && (
+              <>
+                {' · '}
+                {usage.latency_ms < 1000
+                  ? `${usage.latency_ms} ms`
+                  : `${(usage.latency_ms / 1000).toFixed(2)} s`}
+              </>
+            )}
           </span>
         )}
       </div>

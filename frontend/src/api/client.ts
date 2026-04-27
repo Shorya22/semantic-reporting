@@ -1,4 +1,10 @@
-import { ModelOption, Session } from '../types'
+import {
+  Conversation,
+  ModelOption,
+  PersistedMessage,
+  Session,
+  UserPreferences,
+} from '../types'
 
 const BASE = '/api/v1'
 
@@ -45,6 +51,54 @@ export const api = {
     apiFetch<{ default_model: string; llm_provider: string; ollama_base_url?: string }>('/config'),
 
   getOllamaModels: () => apiFetch<ModelOption[]>('/ollama/models'),
+
+  // ---- Hydration ---------------------------------------------------------
+
+  listConnections: (): Promise<(Session & { session_id: string })[]> =>
+    apiFetch('/connections'),
+
+  // ---- Conversations -----------------------------------------------------
+
+  listConversations: (): Promise<Conversation[]> =>
+    apiFetch('/conversations'),
+
+  createConversation: (
+    body: { title?: string; connection_id?: string | null; model?: string; provider?: string }
+  ): Promise<Conversation> =>
+    apiFetch('/conversations', { method: 'POST', body: JSON.stringify(body) }),
+
+  getConversation: (
+    id: string
+  ): Promise<{ conversation: Conversation; messages: PersistedMessage[] }> =>
+    apiFetch(`/conversations/${id}`),
+
+  renameConversation: (id: string, title: string): Promise<Conversation> =>
+    apiFetch(`/conversations/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ title }),
+    }),
+
+  updateConversation: (
+    id: string,
+    patch: Partial<Pick<Conversation, 'title' | 'connection_id' | 'model' | 'provider'>>
+  ): Promise<Conversation> =>
+    apiFetch(`/conversations/${id}`, {
+      method: 'PATCH',
+      body: JSON.stringify(patch),
+    }),
+
+  deleteConversation: (id: string): Promise<{ deleted: string }> =>
+    apiFetch(`/conversations/${id}`, { method: 'DELETE' }),
+
+  // ---- Preferences -------------------------------------------------------
+
+  getPreferences: (): Promise<UserPreferences> =>
+    apiFetch('/preferences'),
+
+  updatePreferences: (patch: Partial<UserPreferences>): Promise<UserPreferences> =>
+    apiFetch('/preferences', { method: 'PATCH', body: JSON.stringify(patch) }),
+
+  // ---- Connections -------------------------------------------------------
 
   connectSQLite: (db_path: string): Promise<Session & { session_id: string }> =>
     apiFetch('/connections/sqlite', {
@@ -105,6 +159,12 @@ export const api = {
     model: string,
     provider: string,
     callbacks: {
+      onConversation?: (info: {
+        conversation_id: string
+        user_message_id?: string | null
+        assistant_message_id?: string | null
+        title?: string | null
+      }) => void
       onToken: (t: string) => void
       onChart: (
         id: string,
@@ -130,26 +190,49 @@ export const api = {
         input_tokens: number
         output_tokens: number
         total_tokens: number
+        latency_ms?: number
       }) => void
       onDone: () => void
       onError: (msg: string) => void
-    }
+    },
+    conversationId?: string | null
   ): () => void {
     const controller = new AbortController()
 
     fetch(`${BASE}/query/stream`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId, question, model, provider }),
+      body: JSON.stringify({
+        session_id: sessionId,
+        question,
+        model,
+        provider,
+        conversation_id: conversationId ?? null,
+      }),
       signal: controller.signal,
     })
       .then(async (res) => {
         if (!res.ok || !res.body) {
           const data = await res.json().catch(() => ({}))
-          const msg =
-            res.status === 404
-              ? 'Session not found — the server may have restarted. Please reconnect your database.'
-              : (data as { detail?: string }).detail ?? `HTTP ${res.status}`
+          const detail = (data as { detail?: unknown }).detail
+          let msg: string
+          if (res.status === 404) {
+            msg = 'Session not found — the server may have restarted. Please reconnect your database.'
+          } else if (Array.isArray(detail)) {
+            // FastAPI validation error: [{loc, msg, type, ctx}, ...]
+            msg = detail
+              .map((d) => {
+                const e = d as { loc?: unknown[]; msg?: string }
+                const field = Array.isArray(e.loc) ? e.loc.slice(1).join('.') : ''
+                return field ? `${field}: ${e.msg ?? ''}` : (e.msg ?? '')
+              })
+              .filter(Boolean)
+              .join('; ')
+          } else if (typeof detail === 'string') {
+            msg = detail
+          } else {
+            msg = `HTTP ${res.status}`
+          }
           callbacks.onError(msg)
           return
         }
@@ -170,6 +253,14 @@ export const api = {
             try {
               const evt = JSON.parse(line.slice(6)) as Record<string, unknown>
               switch (evt.type) {
+                case 'conversation':
+                  callbacks.onConversation?.({
+                    conversation_id:      evt.conversation_id as string,
+                    user_message_id:      (evt.user_message_id as string | null) ?? null,
+                    assistant_message_id: (evt.assistant_message_id as string | null) ?? null,
+                    title:                (evt.title as string | null) ?? null,
+                  })
+                  break
                 case 'token':
                   callbacks.onToken((evt.content as string) ?? '')
                   break
@@ -216,6 +307,7 @@ export const api = {
                     input_tokens: (evt.input_tokens as number) ?? 0,
                     output_tokens: (evt.output_tokens as number) ?? 0,
                     total_tokens: (evt.total_tokens as number) ?? 0,
+                    latency_ms: (evt.latency_ms as number) ?? 0,
                   })
                   break
                 case 'done':

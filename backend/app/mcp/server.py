@@ -39,7 +39,7 @@ Stdio (Claude Desktop subprocess — process-local sessions):
 
     {
       "mcpServers": {
-        "nldb-query": {
+        "datalens-ai": {
           "command": "/path/to/.venv/bin/python",
           "args": ["-m", "app.mcp.server"],
           "cwd": "/path/to/basic_mcp"
@@ -61,9 +61,9 @@ from app.security.sql_guard import validate_read_only
 # ---------------------------------------------------------------------------
 
 mcp = FastMCP(
-    "nldb-query",
+    "datalens-ai",
     instructions=(
-        "Natural Language Database Query server.\n\n"
+        "DataLens AI — Natural Language Database Query server.\n\n"
         "Workflow:\n"
         "1. Connect with connect_sqlite / connect_postgres / load_csv / load_excel.\n"
         "2. Call get_schema to understand the tables and columns.\n"

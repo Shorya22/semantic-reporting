@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'react'
 import { BarChart2, Sparkles, Database, Zap } from 'lucide-react'
 import { useStore } from './store'
 import { useAnalysis } from './hooks/useAnalysis'
+import { useHydrate, useConversationSync, usePreferenceSync } from './hooks/useHydrate'
 import { Header } from './components/Header'
 import { Sidebar } from './components/Sidebar'
 import { QueryBar } from './components/QueryBar'
@@ -26,7 +27,6 @@ function OnboardingScreen() {
         generates interactive charts, and delivers comprehensive analytical reports.
       </p>
 
-      {/* Feature pills */}
       <div className="flex flex-wrap justify-center gap-2 mb-10" aria-label="Key features">
         {[
           { icon: <Zap       className="w-3 h-3" aria-hidden="true" />, label: 'Autonomous Multi-Query' },
@@ -44,7 +44,6 @@ function OnboardingScreen() {
         ))}
       </div>
 
-      {/* Connection instruction */}
       <div className="flex items-center gap-3 text-xs text-slate-500 bg-slate-900/40 border border-slate-800/60 rounded-2xl px-5 py-3.5">
         <div className="w-6 h-6 rounded-lg bg-slate-800 flex items-center justify-center shrink-0" aria-hidden="true">
           <span className="text-indigo-400 font-bold text-xs">←</span>
@@ -86,6 +85,12 @@ function WorkspaceEmpty() {
 }
 
 export default function App() {
+  // Hydrate from backend on mount, keep the active conversation's
+  // messages in sync, and persist preference changes back to the server.
+  useHydrate()
+  useConversationSync()
+  usePreferenceSync()
+
   const { activeSessionId, analyses, isQuerying } = useStore()
   const { runAnalysis } = useAnalysis()
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -101,14 +106,13 @@ export default function App() {
       <Header />
 
       <div className="flex flex-1 min-h-0 overflow-hidden">
-        {/* Left sidebar — connection + session list + history */}
-        <aside className="w-60 shrink-0 overflow-hidden flex flex-col" aria-label="Navigation sidebar">
+        {/* Left sidebar — conversations + connections */}
+        <aside className="w-64 shrink-0 overflow-hidden flex flex-col" aria-label="Navigation sidebar">
           <Sidebar />
         </aside>
 
         {/* Main workspace */}
         <main className="flex-1 flex flex-col min-w-0 overflow-hidden border-l border-slate-800/60">
-          {/* Scrollable results area */}
           <div className="flex-1 overflow-y-auto min-h-0">
             <div className="max-w-5xl mx-auto px-6 py-6 pb-4 space-y-8">
               {!activeSessionId && <OnboardingScreen />}
@@ -125,7 +129,6 @@ export default function App() {
             </div>
           </div>
 
-          {/* Query bar — pinned at bottom */}
           <div className="shrink-0 border-t border-slate-800/60 bg-[#060b18]/95 backdrop-blur-sm px-6 py-4">
             <div className="max-w-5xl mx-auto">
               <QueryBar

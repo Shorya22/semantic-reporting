@@ -12,16 +12,25 @@ export function Header() {
     activeSessionId, sessions,
   } = useStore()
 
+  const hydrated = useStore((s) => s.hydrated)
   const active = sessions.find((s) => s.session_id === activeSessionId)
 
+  // Seed defaults from the server only on the very first run, before
+  // hydration completes. Once hydrated, persisted user choices win.
   useEffect(() => {
+    if (hydrated) return
     api.getConfig()
       .then(({ default_model, llm_provider }) => {
-        setProvider(llm_provider as LlmProvider)
-        setModel(default_model)
+        // Only adopt server defaults if the store hasn't already been
+        // populated by zustand/persist from localStorage.
+        const s = useStore.getState()
+        if (s.model === 'llama-3.3-70b-versatile' && s.provider === 'groq') {
+          setProvider(llm_provider as LlmProvider)
+          setModel(default_model)
+        }
       })
       .catch(() => {})
-  }, [setModel, setProvider])
+  }, [hydrated, setModel, setProvider])
 
   useEffect(() => {
     if (provider !== 'ollama') return

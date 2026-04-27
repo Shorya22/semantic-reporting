@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import time
 import uuid
 from typing import Annotated, Any, AsyncGenerator, Optional
 
@@ -724,7 +725,9 @@ async def run_query(
         else _build_graph(db, resolved_model, resolved_provider, schema_ddl)
     )
 
-    result = await graph.ainvoke(_init_state(question), config=_config(session_id))
+    started = time.perf_counter()
+    result  = await graph.ainvoke(_init_state(question), config=_config(session_id))
+    latency_ms = int((time.perf_counter() - started) * 1000)
 
     answer = ""
     for msg in reversed(result.get("messages", [])):
@@ -733,14 +736,21 @@ async def run_query(
             break
 
     steps: list[dict] = []
+    input_tokens  = 0
+    output_tokens = 0
     for msg in result.get("messages", []):
-        if isinstance(msg, AIMessage) and hasattr(msg, "tool_calls") and msg.tool_calls:
-            for tc in msg.tool_calls:
-                steps.append({
-                    "type":  "tool_call",
-                    "tool":  tc["name"],
-                    "input": str(tc.get("args", {}))[:600],
-                })
+        if isinstance(msg, AIMessage):
+            meta = getattr(msg, "usage_metadata", None)
+            if meta:
+                input_tokens  += meta.get("input_tokens",  0)
+                output_tokens += meta.get("output_tokens", 0)
+            if hasattr(msg, "tool_calls") and msg.tool_calls:
+                for tc in msg.tool_calls:
+                    steps.append({
+                        "type":  "tool_call",
+                        "tool":  tc["name"],
+                        "input": str(tc.get("args", {}))[:600],
+                    })
         elif isinstance(msg, ToolMessage):
             steps.append({
                 "type":   "tool_result",
@@ -753,6 +763,12 @@ async def run_query(
         "steps":         steps,
         "chart_specs":   result.get("chart_specs", []),
         "table_results": result.get("table_results", []),
+        "usage": {
+            "input_tokens":  input_tokens,
+            "output_tokens": output_tokens,
+            "total_tokens":  input_tokens + output_tokens,
+            "latency_ms":    latency_ms,
+        },
     }
 
 
@@ -775,7 +791,7 @@ async def stream_query(
     chart_spec  – ECharts option JSON {option, title, sql, id}
     table_data  – structured query result {columns, rows, sql, title, id}
     export_ctx  – last SQL + session_id (for export buttons)
-    usage       – accumulated token counts
+    usage       – {input_tokens, output_tokens, total_tokens, latency_ms}
     done        – end of stream
     """
     resolved_model    = model    or settings.default_model
@@ -788,6 +804,7 @@ async def stream_query(
 
     input_tokens:  int = 0
     output_tokens: int = 0
+    started: float    = time.perf_counter()
 
     async for event in graph.astream_events(
         _init_state(question),
@@ -870,10 +887,11 @@ async def stream_query(
                         "output": content[:600],
                     }
 
-    if input_tokens or output_tokens:
-        yield {
-            "type":          "usage",
-            "input_tokens":  input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens":  input_tokens + output_tokens,
-        }
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    yield {
+        "type":          "usage",
+        "input_tokens":  input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens":  input_tokens + output_tokens,
+        "latency_ms":    latency_ms,
+    }
