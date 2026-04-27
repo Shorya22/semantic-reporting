@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment — NEVER commit secrets
+.env
+!.env.example
+
+# Databases & uploads
+*.db
+*.db-shm
+*.db-wal
+uploads/
+test_debug.db
+
+# Node / frontend
+node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/build/
+
+# macOS
+.DS_Store
+**/.DS_Store
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Playwright
+.playwright-mcp/
+
+# Lock files (keep uv.lock, exclude others if desired)
+# uv.lock  ← keep this
+
+# Misc
+*.log
+*.tmp
+tmp/

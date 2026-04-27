@@ -1,0 +1,276 @@
+"""
+Pydantic request / response schemas for the NL-DB Query REST API.
+
+All request models use ``Field(...)`` or ``Field(default)`` with explicit
+``description`` values so that the auto-generated OpenAPI docs are
+self-explanatory without requiring any extra annotation.
+"""
+
+from typing import Any, Literal, Optional
+
+from pydantic import BaseModel, Field
+
+
+# ---------------------------------------------------------------------------
+# Connection request schemas
+# ---------------------------------------------------------------------------
+
+
+class SQLiteConnectRequest(BaseModel):
+    """
+    Payload for connecting to a local SQLite database file.
+
+    The server resolves the path to an absolute form, so both absolute and
+    relative paths are accepted.  Relative paths are resolved from the working
+    directory of the server process.
+    """
+
+    db_path: str = Field(
+        ...,
+        description=(
+            "Filesystem path to the SQLite database file, e.g. "
+            "'/home/user/data/sales.db' or '../expenses.db'."
+        ),
+        examples=["/Users/alice/data/expenses.db"],
+    )
+    session_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "Optional UUID to reuse for this session.  When omitted a new UUID "
+            "is generated automatically.  Supply an existing ID to overwrite a "
+            "previous session with a new connection."
+        ),
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {"db_path": "/absolute/path/to/database.db"}
+        }
+    }
+
+
+class PostgresConnectRequest(BaseModel):
+    """
+    Payload for connecting to a PostgreSQL database over the network.
+
+    The credentials are used to build a SQLAlchemy connection URI of the form
+    ``postgresql://user:password@host:port/database``.
+    """
+
+    host: str = Field(
+        ...,
+        description="Hostname or IP address of the PostgreSQL server.",
+        examples=["localhost", "db.example.com"],
+    )
+    port: int = Field(
+        default=5432,
+        ge=1,
+        le=65535,
+        description="TCP port the PostgreSQL server listens on (default: 5432).",
+    )
+    database: str = Field(
+        ...,
+        description="Name of the PostgreSQL database to connect to.",
+        examples=["sales_db", "analytics"],
+    )
+    user: str = Field(
+        ...,
+        description="PostgreSQL username.",
+        examples=["admin", "readonly_user"],
+    )
+    password: str = Field(
+        ...,
+        description="Password for the PostgreSQL user.",
+    )
+    session_id: Optional[str] = Field(
+        default=None,
+        description="Optional UUID to assign to this session.",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "host": "localhost",
+                "port": 5432,
+                "database": "mydb",
+                "user": "postgres",
+                "password": "secret",
+            }
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# Query request schema
+# ---------------------------------------------------------------------------
+
+
+class QueryRequest(BaseModel):
+    """
+    Payload for submitting a natural-language query against a connected database.
+
+    The ``session_id`` must correspond to an active connection previously created
+    via one of the ``/connections/*`` endpoints or the file upload endpoint.
+    """
+
+    session_id: str = Field(
+        ...,
+        description=(
+            "UUID of the active database session to query.  Obtained from the "
+            "response of any connection endpoint."
+        ),
+    )
+    question: str = Field(
+        ...,
+        min_length=3,
+        description=(
+            "Natural-language question about the data, e.g. "
+            "'What are the top 5 expense categories by total amount?'"
+        ),
+        examples=["Show total expenses grouped by category"],
+    )
+    model: Optional[str] = Field(
+        default=None,
+        description=(
+            "Model ID to use for this query.  When ``null`` the server falls back to "
+            "the configured default.  For GroqCloud: 'llama-3.3-70b-versatile', "
+            "'llama-3.1-8b-instant', 'mixtral-8x7b-32768', 'gemma2-9b-it'.  "
+            "For Ollama: any model name available on the local server (e.g. 'llama3.2')."
+        ),
+    )
+    provider: Optional[str] = Field(
+        default=None,
+        description=(
+            "LLM provider override for this request: 'groq' or 'ollama'.  "
+            "When ``null`` the server uses the configured default (LLM_PROVIDER in .env)."
+        ),
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "session_id": "550e8400-e29b-41d4-a716-446655440000",
+                "question": "What are the top 5 expense categories by total amount?",
+                "model": None,
+                "provider": None,
+            }
+        }
+    }
+
+
+# ---------------------------------------------------------------------------
+# Inner response fragments
+# ---------------------------------------------------------------------------
+
+
+class QueryStep(BaseModel):
+    """
+    A single reasoning or tool-interaction step produced by the SQL agent.
+
+    Consumers can use the ``type`` field to decide how to render each step:
+    - ``tool_call``   – the agent decided to call a database tool
+    - ``tool_result`` – the tool returned a result
+    - ``ai_message``  – an intermediate LLM reasoning message
+    """
+
+    type: Literal["tool_call", "tool_result", "ai_message"] = Field(
+        ...,
+        description=(
+            "Step category: 'tool_call' when the agent invoked a tool, "
+            "'tool_result' when the tool returned data, "
+            "'ai_message' for intermediate LLM reasoning text."
+        ),
+    )
+    tool: Optional[str] = Field(
+        default=None,
+        description=(
+            "Name of the SQL toolkit tool that was called or that returned a result "
+            "(e.g. 'sql_db_query', 'sql_db_schema').  ``null`` for 'ai_message' steps."
+        ),
+    )
+    input: Optional[str] = Field(
+        default=None,
+        description="Stringified arguments passed to the tool.  Present only on 'tool_call' steps.",
+    )
+    output: Optional[str] = Field(
+        default=None,
+        description=(
+            "Truncated string representation of the tool's return value (max 1 000 chars).  "
+            "Present only on 'tool_result' steps."
+        ),
+    )
+    content: Optional[str] = Field(
+        default=None,
+        description="Intermediate reasoning text from the LLM.  Present only on 'ai_message' steps.",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Export / visualization request schemas
+# ---------------------------------------------------------------------------
+
+
+class ExportRequest(BaseModel):
+    """Payload for CSV / Excel / PDF export endpoints."""
+
+    session_id: str = Field(
+        ...,
+        description="UUID of the active database session.",
+    )
+    sql: str = Field(
+        ...,
+        min_length=3,
+        description="Complete SQL SELECT statement whose results to export.",
+    )
+    chart_b64: Optional[str] = Field(
+        default=None,
+        description="Base64-encoded PNG chart image to embed in Excel/PDF exports.",
+    )
+    title: str = Field(
+        default="Data Report",
+        description="Report title used in Excel and PDF exports.",
+    )
+
+
+class ChartRequest(BaseModel):
+    """Payload for the /visualize endpoint."""
+
+    session_id: str = Field(..., description="UUID of the active database session.")
+    sql: str = Field(..., min_length=3, description="SQL SELECT statement to execute.")
+    chart_spec: dict = Field(
+        ...,
+        description=(
+            "Chart specification dict.  Required key: ``chart_type`` "
+            "(bar | line | area | scatter | pie | donut | histogram | heatmap | "
+            "treemap | funnel | box | violin | bubble | waterfall | gauge).  "
+            "Optional: title, x, y, color, aggregation, sort, limit."
+        ),
+    )
+    width:  int = Field(default=900,  ge=200, le=3000, description="Image width in pixels.")
+    height: int = Field(default=500,  ge=200, le=3000, description="Image height in pixels.")
+
+
+# ---------------------------------------------------------------------------
+# Envelope
+# ---------------------------------------------------------------------------
+
+
+class ApiResponse(BaseModel):
+    """
+    Standard response envelope used by every endpoint.
+
+    Either ``data`` is populated (on success) or ``error`` is populated (on
+    failure).  Both fields are never ``null`` at the same time.
+    """
+
+    data: Any = Field(
+        default=None,
+        description="Response payload on success.  Shape varies by endpoint.",
+    )
+    error: Optional[str] = Field(
+        default=None,
+        description=(
+            "Human-readable error message when the request could not be completed.  "
+            "``null`` on success."
+        ),
+    )
