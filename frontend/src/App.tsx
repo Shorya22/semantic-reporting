@@ -1,5 +1,8 @@
 import { useEffect, useRef } from 'react'
-import { BarChart2, Sparkles, Database, Zap } from 'lucide-react'
+import {
+  BarChart2, Sparkles, Database, Zap,
+  PanelLeftClose, PanelLeftOpen,
+} from 'lucide-react'
 import { useStore } from './store'
 import { useAnalysis } from './hooks/useAnalysis'
 import { useHydrate, useConversationSync, usePreferenceSync } from './hooks/useHydrate'
@@ -92,8 +95,25 @@ export default function App() {
   usePreferenceSync()
 
   const { activeSessionId, analyses, isQuerying } = useStore()
+  const sidebarCollapsed = useStore((s) => s.sidebarCollapsed)
+  const toggleSidebar    = useStore((s) => s.toggleSidebar)
   const { runAnalysis } = useAnalysis()
   const bottomRef = useRef<HTMLDivElement>(null)
+
+  // ⌘B / Ctrl+B toggles the sidebar globally — except when typing in inputs.
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      const meta = e.metaKey || e.ctrlKey
+      if (!meta || e.key.toLowerCase() !== 'b') return
+      const t = e.target as HTMLElement | null
+      const tag = t?.tagName
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || t?.isContentEditable) return
+      e.preventDefault()
+      toggleSidebar()
+    }
+    window.addEventListener('keydown', onKey)
+    return () => window.removeEventListener('keydown', onKey)
+  }, [toggleSidebar])
 
   useEffect(() => {
     if (analyses.length) {
@@ -105,11 +125,50 @@ export default function App() {
     <div className="flex flex-col h-screen overflow-hidden" style={{ background: '#060b18' }}>
       <Header />
 
-      <div className="flex flex-1 min-h-0 overflow-hidden">
-        {/* Left sidebar — conversations + connections */}
-        <aside className="w-64 shrink-0 overflow-hidden flex flex-col" aria-label="Navigation sidebar">
+      <div className="flex flex-1 min-h-0 overflow-hidden relative">
+        {/* Left sidebar — conversations + connections.
+            Width animates between collapsed (0) and expanded (16rem). The
+            `Sidebar` component is always mounted so its scroll position and
+            local state survive the toggle; it's clipped by `overflow-hidden`
+            when collapsed. */}
+        <aside
+          aria-label="Navigation sidebar"
+          aria-hidden={sidebarCollapsed}
+          className={`shrink-0 overflow-hidden flex flex-col transition-[width] duration-300 ease-in-out ${
+            sidebarCollapsed ? 'w-0' : 'w-64'
+          }`}
+        >
           <Sidebar />
         </aside>
+
+        {/* Edge-tab toggle — anchored to the seam between sidebar and main.
+            Slides with the sidebar via the same `left-X` width transition.
+            Always visible, even when the sidebar is collapsed. */}
+        <button
+          type="button"
+          onClick={toggleSidebar}
+          aria-label={sidebarCollapsed ? 'Show sidebar (Ctrl+B)' : 'Hide sidebar (Ctrl+B)'}
+          aria-pressed={!sidebarCollapsed}
+          title={sidebarCollapsed ? 'Show sidebar  ⌘B' : 'Hide sidebar  ⌘B'}
+          className={`
+            group absolute top-1/2 z-30
+            -translate-x-1/2 -translate-y-1/2
+            w-7 h-7 rounded-lg
+            flex items-center justify-center
+            bg-slate-900/95 backdrop-blur-sm
+            border border-slate-700/60 hover:border-indigo-500/50
+            text-slate-400 hover:text-indigo-300
+            shadow-lg shadow-black/40
+            focus:outline-none focus:ring-2 focus:ring-indigo-500/40
+            transition-[left,colors,border-color,box-shadow]
+            duration-300 ease-in-out
+            ${sidebarCollapsed ? 'left-0' : 'left-64'}
+          `}
+        >
+          {sidebarCollapsed
+            ? <PanelLeftOpen  className="w-3.5 h-3.5" aria-hidden="true" />
+            : <PanelLeftClose className="w-3.5 h-3.5" aria-hidden="true" />}
+        </button>
 
         {/* Main workspace */}
         <main className="flex-1 flex flex-col min-w-0 overflow-hidden border-l border-slate-800/60">

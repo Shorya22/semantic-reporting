@@ -37,6 +37,7 @@ interface AppStore {
   provider: LlmProvider
   activeSessionId: string | null
   activeConversationId: string | null
+  sidebarCollapsed: boolean
 
   // ---- Ephemeral state ----------------------------------------------------
   hydrated: boolean
@@ -52,6 +53,8 @@ interface AppStore {
   setProvider: (p: LlmProvider) => void
   setActiveSession: (id: string | null) => void
   setActiveConversation: (id: string | null) => void
+  setSidebarCollapsed: (v: boolean) => void
+  toggleSidebar: () => void
 
   // ---- Hydration ----------------------------------------------------------
   setHydrated: (h: boolean) => void
@@ -125,6 +128,7 @@ export const useStore = create<AppStore>()(
       provider: 'groq',
       activeSessionId: null,
       activeConversationId: null,
+      sidebarCollapsed: false,
 
       // ---- Ephemeral defaults ---------------------------------------------
       hydrated: false,
@@ -140,6 +144,8 @@ export const useStore = create<AppStore>()(
       setProvider:            (provider) => set({ provider }),
       setActiveSession:       (id) => set({ activeSessionId: id }),
       setActiveConversation:  (id) => set({ activeConversationId: id }),
+      setSidebarCollapsed:    (v) => set({ sidebarCollapsed: v }),
+      toggleSidebar:          () => set((st) => ({ sidebarCollapsed: !st.sidebarCollapsed })),
 
       // ---- Hydration ------------------------------------------------------
       setHydrated:      (hydrated) => set({ hydrated }),
@@ -288,6 +294,7 @@ export const useStore = create<AppStore>()(
         provider:             s.provider,
         activeSessionId:      s.activeSessionId,
         activeConversationId: s.activeConversationId,
+        sidebarCollapsed:     s.sidebarCollapsed,
       }),
     },
   ),

@@ -37,6 +37,9 @@ frontend/build/
 .idea/
 *.swp
 
+# Claude Code runtime
+.claude/
+
 # Playwright
 .playwright-mcp/
 
