@@ -92,6 +92,9 @@ def _msg_to_dict(m: Message) -> dict[str, Any]:
         "status":          m.status,
         "error":           m.error,
         "created_at":      m.created_at.isoformat() if m.created_at else None,
+        "visuals":         m.visuals_json,
+        "insight_report":  m.insight_json,
+        "critique":        m.critique_json,
     }
 
 
@@ -302,6 +305,9 @@ class MessageRepo:
         status: str = "done",
         error: Optional[str] = None,
         message_id: Optional[str] = None,
+        visuals: Optional[list] = None,
+        insight_report: Optional[dict] = None,
+        critique: Optional[dict] = None,
     ) -> Message:
         m = Message(
             id=message_id or _new_id(),
@@ -315,6 +321,9 @@ class MessageRepo:
             export_sql=export_sql,
             status=status,
             error=error,
+            visuals_json=visuals,
+            insight_json=insight_report,
+            critique_json=critique,
         )
         session.add(m)
         session.flush()

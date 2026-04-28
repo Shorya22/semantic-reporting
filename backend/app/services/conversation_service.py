@@ -105,6 +105,9 @@ def append_assistant_message(
     status: str = "done",
     error: Optional[str] = None,
     message_id: Optional[str] = None,
+    visuals: Optional[list] = None,
+    insight_report: Optional[dict] = None,
+    critique: Optional[dict] = None,
 ) -> dict[str, Any]:
     with session_scope() as s:
         msg = MessageRepo.add(
@@ -120,6 +123,9 @@ def append_assistant_message(
             status=status,
             error=error,
             message_id=message_id,
+            visuals=visuals,
+            insight_report=insight_report,
+            critique=critique,
         )
         ConversationRepo.touch(s, conversation_id)
         return message_to_dict(msg)

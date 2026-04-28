@@ -1,6 +1,6 @@
 # Low-Level Design — Semantic Reporting (NL-DB Query)
 
-> Last updated: 2026-04-27 (rev. token+latency telemetry, persistence, cache, crypto)
+> Last updated: 2026-04-28 (rev. structured output across all agents, two-layer critic, orchestrator re-plan + clarification routing, DataFacts single-computation, example-queries endpoint, usage accumulator)
 
 ---
 
@@ -18,7 +18,17 @@ backend/
 │   │   ├── conversation_routes.py    Conversations, messages, preferences endpoints
 │   │   └── schemas.py                Pydantic request / response models
 │   ├── agents/
-│   │   └── sql_agent.py              LangGraph ReAct graph + token/latency telemetry
+│   │   ├── orchestrator.py           Multi-agent pipeline driver — emits SSE events
+│   │   ├── intent_classifier.py      Stage 1: classifies the prompt (structured output)
+│   │   ├── schema_agent.py           Stage 2: cached DDL + per-column profiles
+│   │   ├── planner.py                Stage 3: builds typed AnalysisPlan (structured output)
+│   │   ├── sql_workers.py            Stage 4: parallel queries + two-strategy repair
+│   │   ├── viz_designer.py           Stage 5: deterministic visual builder
+│   │   ├── insight_agent.py          Stage 6: DataFacts-grounded narrative (structured output)
+│   │   ├── critic.py                 Stage 7: two-layer quality gate (structured output)
+│   │   ├── _usage.py                 Pipeline-wide token accumulator (contextvars)
+│   │   ├── llm_factory.py            Per-agent LLM resolver (model/provider/temp/max_tokens)
+│   │   └── sql_agent.py              Legacy LangGraph ReAct agent — used by /query (non-streaming)
 │   ├── cache/
 │   │   ├── __init__.py               Re-exports `cache` singleton
 │   │   └── cache.py                  Two-tier cache (Redis → in-process TTLCache)
@@ -28,7 +38,8 @@ backend/
 │   │   ├── models.py                 ORM models: Connection, Conversation, Message, Preference
 │   │   └── repositories.py           Repository classes wrapping all SQL access
 │   ├── security/
-│   │   ├── sql_guard.py              AST-level read-only SQL validation (sqlglot)
+│   │   ├── guardrails.py             Input-stage check (prompt-injection, off-topic, destructive intent)
+│   │   ├── sql_guard.py              AST-level read-only SQL validation (sqlglot) — hardened
 │   │   └── crypto.py                 Fernet encrypt/decrypt for credentials at rest
 │   ├── services/
 │   │   ├── viz_service.py            ECharts JSON builder + Plotly PNG renderer
@@ -77,7 +88,24 @@ class Settings(BaseSettings):
     # ---- Crypto -------------------------------------------------------------
     app_secret_key: str = ""                          # set via secrets manager in prod
 
+    # ---- Per-agent LLM config (multi-agent pipeline) ------------------------
+    # Each role has model_*, provider_*, max_tokens_*, temp_*; missing/zero
+    # slots fall through to the global defaults (default_model / llm_provider /
+    # agent_max_tokens / 0.0). Resolved via Settings.agent_config(name).
+    AGENT_NAMES = (
+        "intent_classifier",  # cheap+fast (8B)         — < 500 ms; structured output
+        "planner",            # reasoning (70B)         — produces AnalysisPlan; structured output
+        "schema",             # 8B (rarely an LLM call) — DDL + profiling
+        "sql_agent",          # 70B tool-capable        — repair strategies A + B
+        "viz_designer",       # 8B                      — chart-type heuristics (deterministic)
+        "insight_agent",      # 70B (temp=0.3)          — DataFacts-grounded narrative; structured output
+        "critic",             # 8B                      — two-layer quality gate; structured output
+    )
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
+
+    def agent_config(self, name: str) -> AgentLLMConfig:
+        """(model, provider, max_tokens, temperature) for the given role."""
 ```
 
 **`.env` keys (all optional unless marked):**
@@ -102,6 +130,18 @@ CACHE_OLLAMA_TTL=60
 
 # Crypto
 APP_SECRET_KEY=                      # 44-char Fernet.generate_key().decode() — REQUIRED in prod
+
+# Per-agent LLM (omit any line to inherit the global default)
+# Per-agent overrides — omit any line to inherit global defaults.
+# Structured-output agents (intent, planner, insight, critic) use include_raw=True;
+# token budget must accommodate the JSON schema + reasoning + output.
+MODEL_INTENT_CLASSIFIER=llama-3.1-8b-instant   PROVIDER_INTENT_CLASSIFIER=groq   MAX_TOKENS_INTENT_CLASSIFIER=400   TEMP_INTENT_CLASSIFIER=0
+MODEL_PLANNER=llama-3.3-70b-versatile          PROVIDER_PLANNER=groq             MAX_TOKENS_PLANNER=2048            TEMP_PLANNER=0
+MODEL_SCHEMA=llama-3.1-8b-instant              PROVIDER_SCHEMA=groq              MAX_TOKENS_SCHEMA=1024             TEMP_SCHEMA=0
+MODEL_SQL_AGENT=llama-3.3-70b-versatile        PROVIDER_SQL_AGENT=groq           MAX_TOKENS_SQL_AGENT=1024          TEMP_SQL_AGENT=0
+MODEL_VIZ_DESIGNER=llama-3.1-8b-instant        PROVIDER_VIZ_DESIGNER=groq        MAX_TOKENS_VIZ_DESIGNER=800        TEMP_VIZ_DESIGNER=0
+MODEL_INSIGHT_AGENT=llama-3.3-70b-versatile    PROVIDER_INSIGHT_AGENT=groq       MAX_TOKENS_INSIGHT_AGENT=1500      TEMP_INSIGHT_AGENT=0.3
+MODEL_CRITIC=llama-3.1-8b-instant              PROVIDER_CRITIC=groq              MAX_TOKENS_CRITIC=500              TEMP_CRITIC=0
 ```
 
 The data directory (`backend/data/`) is created on import — SQLAlchemy creates `app.db` there on first start, and `crypto.py` writes `.secret_key` there as a dev fallback when `APP_SECRET_KEY` is unset.
@@ -168,7 +208,56 @@ Raises `ValueError` if the SQL contains any write or schema-altering operation.
 
 ---
 
-### 1.5 `app/agents/sql_agent.py` — LangGraph ReAct Agent
+### 1.4b `app/security/guardrails.py` — Input Guardrails
+
+**Functions:**
+* `check_prompt(question: str) → GuardrailResult` — sync; returns `{passed: bool, category: "ok" | "prompt_injection" | "destructive" | "off_topic", refusal_message: str | None}`.
+* `attach_to_orchestrator(yield_fn)` — convenience adapter used by `orchestrator.run_orchestrator` so a refusal becomes a clean `error` SSE event with no LLM call.
+
+**What gets blocked (regex catalogue):**
+
+| Category | Examples |
+|---|---|
+| `prompt_injection` | "ignore previous instructions", "you are now …", "system prompt is:", role-play takeovers, jailbreak phrasings |
+| `destructive` | "drop the table", "delete all rows", "wipe", "truncate", any natural-language ask to mutate data |
+| `off_topic` | obvious creative-writing / world-knowledge / unrelated-code asks; bias is conservative — subtle off-topic is left to the agent system prompts |
+
+A hit returns a deterministic, user-facing refusal string. Zero LLM tokens, zero DB hit. This is the **first** of the five read-only defence layers.
+
+---
+
+### 1.4c `app/db/manager.py` — Engine-level read-only
+
+The fourth layer is the database engine itself:
+
+```python
+# SQLite — PRAGMA query_only is per-connection and persists for its lifetime.
+def _attach_sqlite_readonly(engine: Engine) -> None:
+    @event.listens_for(engine, "connect")
+    def _on_connect(dbapi_conn, _record):
+        cur = dbapi_conn.cursor()
+        cur.execute("PRAGMA query_only = ON")
+        cur.close()
+    # Sweep any pre-existing pooled connection (e.g. from CSV df.to_sql).
+    with engine.connect() as conn:
+        conn.exec_driver_sql("PRAGMA query_only = ON")
+
+# Postgres — psycopg2 connect_args.options
+_PG_READONLY_CONNECT_ARGS = {
+    "options": "-c default_transaction_read_only=on -c statement_timeout=30000",
+}
+```
+
+`connect_sqlite` calls `_attach_sqlite_readonly(db._engine)` after `from_uri`; `connect_postgres` passes `engine_args={"connect_args": _PG_READONLY_CONNECT_ARGS, "pool_pre_ping": True}` to `SQLDatabase.from_uri`. CSV / Excel loaders call the same helper *after* `df.to_sql` finishes so the data load itself isn't blocked, but every subsequent connection from that engine is read-only.
+
+---
+
+### 1.5 `app/agents/sql_agent.py` — Legacy LangGraph ReAct Agent
+
+**Used by `POST /query` (non-streaming) only.** The streaming endpoint
+`POST /query/stream` routes through `app/agents/orchestrator.py` (see
+§1.5b). Documented here for completeness — cURL / scripted clients still
+get the simpler behaviour.
 
 #### State Schema
 
@@ -308,6 +397,255 @@ the assistant message so it survives reload.
 {"type": "done"}
 {"type": "error",      "content": str}
 ```
+
+---
+
+### 1.5b `app/agents/orchestrator.py` — Multi-Agent Pipeline
+
+The streaming endpoint runs through **`run_orchestrator(question, db, session_id, schema_ddl_hint=None)`** — an `AsyncGenerator[dict, None]` that yields SSE-shaped event dicts at each pipeline stage. Route handler wraps each in `data: {json}\n\n`.
+
+#### Pipeline constants
+
+```python
+_REPLAN_FAILURE_THRESHOLD = 0.50   # re-plan when this fraction of queries fail
+_MAX_INSIGHT_RETRIES      = 2      # max critic-driven insight regeneration attempts
+_CLARIFICATION_THRESHOLD  = 0.35   # confidence below this triggers clarification
+```
+
+#### Full pipeline flow
+
+```
+question
+   │
+   ├─→ start_bucket()             reset per-pipeline token accumulator
+   │
+   ├─→ classify_intent ──────────► Intent  ─→ event: intent
+   │
+   ├─→ get_schema_context ────────► SchemaContext (cached in Redis)
+   │     ↑ fetched BEFORE trivial branches so replies can use real table names
+   │
+   ├─→ Trivial branch (no SQL, no planner):
+   │     intent == "greeting"        → _greeting_reply(schema) → token stream → done
+   │     intent == "help"            → _help_reply(schema)     → token stream → done
+   │     confidence < 0.35           → clarification prompt    → token stream → done
+   │
+   ├─→ plan_analysis ─────────────► AnalysisPlan ─→ event: plan
+   │     (no queries → polite token + done)
+   │
+   ├─→ _execute_plan_queries()       ─→ event: query_start × N
+   │     AsyncGenerator — yields (event, result) in completion order
+   │     per query: SQLGuard → execute → Strategy A (column fix)
+   │                → Strategy B (full rewrite) → cache hit
+   │                                               ─→ event: query_done × N
+   │
+   ├─→ Re-plan if >50% queries failed:
+   │     amend question with error context → plan_analysis → re-execute
+   │     adopt only if new_failed < original_failed
+   │                                               ─→ event: plan (replan=true)
+   │                                               ─→ event: query_start × N
+   │                                               ─→ event: query_done × N
+   │
+   ├─→ design_visual × M ─────────► RenderedVisual ─→ event: viz × M
+   │     also back-compat:                          ─→ event: chart_spec × M
+   │                                               ─→ event: table_data × M
+   │     after all visuals:                        ─→ event: dashboard_layout
+   │
+   ├─→ facts = compute_data_facts(plan, results)   ← computed ONCE, shared below
+   │
+   ├─→ generate_insights(…, data_facts=facts) ─────► InsightReport
+   │     executive_summary streamed as token events ─→ event: insight
+   │
+   ├─→ Critic feedback loop (up to _MAX_INSIGHT_RETRIES):
+   │     critique(…, data_facts=facts)
+   │       Layer 1 programmatic: number hallucination + empty-result check
+   │       Layer 2 LLM semantic: receives Layer 1 verdicts, semantic-only scope
+   │     if error issues → generate_insights(…, critique_feedback=errors)
+   │                                               ─→ event: insight (updated)
+   │     final report:                            ─→ event: critique
+   │
+   ├─→ export_ctx (last successful SQL)           ─→ event: export_ctx
+   │
+   ├─→ totals() from usage accumulator            ─→ event: usage
+   │     {intent_latency_ms, plan_latency_ms, insight_latency_ms,
+   │      total_elapsed_ms, input_tokens, output_tokens, total_tokens}
+   │
+   └─→ event: done {elapsed_ms}
+```
+
+#### `_execute_plan_queries` — async generator
+
+```python
+async def _execute_plan_queries(
+    plan: AnalysisPlan,
+    db: SQLDatabase,
+    session_id: str,
+    schema_ddl: str,
+) -> AsyncGenerator[tuple[dict[str, Any], QueryResult], None]:
+    """
+    Run all PlannedQuery tasks concurrently. Yields (query_done_event, result)
+    tuples in completion order so the orchestrator streams them in real time.
+    """
+    pending: dict[str, asyncio.Task[QueryResult]] = {
+        q.id: asyncio.create_task(run_one_query(q, db, session_id, schema_ddl))
+        for q in plan.queries
+    }
+    while pending:
+        done, _ = await asyncio.wait(pending.values(), return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            result = task.result()
+            event = _evt("query_done", query_id=result.query_id, success=result.success,
+                         rows_count=result.rows_count, latency_ms=result.latency_ms,
+                         repaired=result.repaired, repair_strategy=result.repair_strategy,
+                         error=result.error)
+            yield event, result
+            # remove finished task from pending
+```
+
+This generator is called twice when re-planning occurs — the same helper handles both the initial run and the re-plan run.
+
+#### Dynamic trivial-intent reply helpers
+
+```python
+def _greeting_reply(schema: Optional[SchemaContext] = None) -> str:
+    # Uses schema.profiles to list the first 4 real table names in the reply
+    # e.g. "I have access to tables like *users*, *transactions*, *orders* and more."
+
+def _help_reply(schema: Optional[SchemaContext] = None) -> str:
+    # Appends schema.summary (e.g. "PostgreSQL: 12 tables") to the capability list
+```
+
+**Per-agent files (under `app/agents/`):**
+
+| File | Role | LLM | Structured Output | Notes |
+|---|---|---|---|---|
+| `intent_classifier.py` | Stage 1 | 8B (400 tok, temp 0) | `Intent` via `with_structured_output` | Deterministic short-circuit for greetings/help (no LLM); `latency_ms` set post-call |
+| `schema_agent.py` | Stage 2 | 8B (rarely used) | `SchemaContext` (direct Python) | Cached in Redis at `cache_schema_ttl` (1 day); fetched before trivial branches |
+| `planner.py` | Stage 3 | 70B (2048 tok, temp 0) | `AnalysisPlan` via `with_structured_output` | `_validate_plan()` fixes referential integrity post-parse; `_safe_*` coerce fallback; `_validate_plan()` builds default layout if LLM omits it |
+| `sql_workers.py` | Stage 4 | 70B (repair only, 1024 tok) | `QueryResult` (plain Python) | `validate_read_only()` before first exec + before each repair; Strategy A (column fix) → Strategy B (full rewrite) on failure; results cached for `cache_query_ttl` (5 min) |
+| `viz_designer.py` | Stage 5 | none — deterministic | `RenderedVisual` (plain Python) | No LLM call; maps `PlannedVisual + QueryResult` → KPI / ECharts option / table |
+| `insight_agent.py` | Stage 6 | 70B (1500 tok, temp 0.3) | `InsightReport` via `with_structured_output` | Never sees raw rows — only `DataFacts`; `latency_ms` has `exclude=True` (not in LLM schema); max 6 key_findings, max 3 anomalies/recommendations |
+| `critic.py` | Stage 7 | 8B (500 tok, temp 0) | `_CriticLLMOutput` via `with_structured_output` | Layer 1 programmatic runs before LLM; LLM receives verified-numbers block; result merged into `CritiqueReport`; never blocks delivery |
+| `_usage.py` | infra | — | — | `contextvars.ContextVar`-based; `start_bucket()` / `record(response)` / `totals()` |
+| `llm_factory.py` | infra | — | — | `llm_for(name, *, streaming, override_model, override_provider, override_max_tokens)` — single source of truth for `ChatGroq` / `ChatOllama` instantiation |
+
+**`AGENT_NAMES`** (in `app/config.py`) is the canonical list — typos raise `KeyError` from `Settings.agent_config(name)` so misconfiguration surfaces at boot, not at runtime.
+
+#### Structured output pattern (used by all LLM agents)
+
+```python
+llm = llm_for("agent_name")
+structured_llm = llm.with_structured_output(OutputModel, include_raw=True)
+result = await structured_llm.ainvoke([SystemMessage(content=...), HumanMessage(content=...)])
+from app.agents._usage import record as _record_usage
+_record_usage(result["raw"])                       # token tracking
+if result["parsed"] is not None and result["parsing_error"] is None:
+    return result["parsed"].model_copy(update={"latency_ms": elapsed()})
+# fallback: lenient JSON parse on result["raw"].content
+```
+
+#### `_CriticLLMOutput` — internal critic model
+
+```python
+class _CriticLLMOutput(BaseModel):
+    passed: bool   # True only if NO error-severity issues
+    score: float   # 1.0 - (0.3 × errors) - (0.1 × warnings) - (0.02 × info)
+    issues: list[Issue]  # semantic only; must NOT include ✓-verified numbers
+
+# critique() merges _CriticLLMOutput with programmatic Layer 1 issues:
+final_score = max(0.0, min(1.0, llm_score - len(prog_issues) * 0.2))
+return CritiqueReport(passed=not has_error and llm_passed, score=final_score, issues=all_issues)
+```
+
+#### `DataFacts` — anti-hallucination grounding
+
+```python
+# In orchestrator (called ONCE):
+facts: list[QueryFacts] = compute_data_facts(plan, results)
+
+# Passed to both:
+insight = await generate_insights(question, intent, plan, results, data_facts=facts)
+report  = await critique(question, intent, plan, results, insight, data_facts=facts)
+```
+
+`QueryFacts` contains per-column `ColumnFacts` with `col_type`, `row_count`, `min_val`, `max_val`, `sum_val`, `avg_val`, `all_unique_values` (capped at 50), `top_values` (top 15 categories). The Insight Agent never sees raw rows.
+
+#### SSE event shapes (streaming endpoint)
+
+```
+{type: "conversation",   conversation_id, user_message_id, assistant_message_id, title}
+{type: "intent",         intent, wants_chart, wants_dashboard, wants_export, chart_hints,
+                         time_window, complexity, keywords, confidence, latency_ms}
+{type: "plan",           title, description, query_count, visual_count, layout,
+                         latency_ms, replan: bool}   # replan=true on the re-plan event
+{type: "query_start",    query_id, purpose}
+{type: "query_done",     query_id, success, rows_count, latency_ms,
+                         repaired: bool, repair_strategy: "column_fix"|"full_rewrite"|null,
+                         error: str|null}
+{type: "viz",            visual_id, visual_type, title, subtitle, from_query, kpi,
+                         echarts_option, table_columns, table_rows, rows_count, error}
+{type: "chart_spec",     id, option, title, sql}                  # back-compat
+{type: "table_data",     id, columns, rows, sql, title}            # back-compat
+{type: "dashboard_layout", title, layout, visuals}
+{type: "insight",        headline, executive_summary, key_findings, anomalies,
+                         recommendations}   # latency_ms excluded from LLM output
+{type: "token",          content}                                  # streamed exec summary
+{type: "critique",       passed, score, issues[{severity, category, message, location}],
+                         latency_ms}
+{type: "export_ctx",     sql, session_id}                          # last successful SQL
+{type: "usage",          intent_latency_ms, plan_latency_ms, insight_latency_ms,
+                         total_elapsed_ms, input_tokens, output_tokens, total_tokens,
+                         latency_ms}
+{type: "done",           elapsed_ms}
+{type: "error",          content}
+```
+
+Older clients that only handle `token` / `chart_spec` / `table_data` / `usage` / `done` continue to work — the orchestrator emits both new and back-compat shapes.
+
+---
+
+### 1.5c `app/agents/_usage.py` — Pipeline Token Accumulator
+
+```python
+# Lifecycle (per pipeline request):
+start_bucket()          # orchestrator calls this at run start; resets ContextVar
+record(response)        # each agent calls after LLM call; accepts AIMessage or dict
+totals() -> (int, int)  # orchestrator calls at end; returns (input_tokens, output_tokens)
+```
+
+Uses `contextvars.ContextVar[_UsageBucket]` — Python's `asyncio` automatically propagates `ContextVar` state into spawned `asyncio.Task` objects, so concurrent SQL workers all write to the same per-request bucket without any explicit synchronisation.
+
+`record()` accepts either a LangChain `AIMessage` (reads `.usage_metadata`) or a plain `dict`. Silently no-ops when called outside an active pipeline (e.g. ad-hoc scripts or tests).
+
+---
+
+### 1.5d `app/agents/sql_workers.py` — Two-Strategy Repair
+
+`run_one_query` flow:
+
+```
+cache hit → return cached result
+
+validate_read_only(pq.sql)  ← block write intent immediately (no repair)
+
+execute pq.sql
+  success → cache + return
+
+  fail → Strategy A: _strategy_column_fix(bad_sql, error, purpose, schema_ddl)
+            LLM is shown the failing SQL + error and asked to fix column/table names only
+            validate_read_only(repaired_a)
+            execute repaired_a
+              success → cache + return (repaired=True, repair_strategy="column_fix")
+
+  fail → Strategy B: _strategy_full_rewrite(purpose, schema_ddl, all_errors)
+            LLM is given only purpose + schema (not the broken SQL) and writes fresh SQL
+            validate_read_only(repaired_b)
+            execute repaired_b
+              success → cache + return (repaired=True, repair_strategy="full_rewrite")
+
+  fail → return QueryResult(success=False, error=last_two_errors joined)
+```
+
+Both strategies use `llm_for("sql_agent")` and call `_record_usage(resp)` for token tracking.
 
 ---
 
@@ -525,6 +863,7 @@ All routes mounted under `/api/v1`.
 | GET | `/connections/{session_id}` | — | `{session_id, ...}` | 404 if not found |
 | DELETE | `/connections/{session_id}` | — | `{message}` | Evicts agent cache too |
 | GET | `/connections/{session_id}/tables` | — | `[table_name, ...]` | 404 if not found |
+| GET | `/connections/{session_id}/example-queries` | — | `["question 1", …]` (4 items) | LLM-generated schema-aware questions; cached at `cache_schema_ttl`; fallback to 4 generic questions on LLM failure |
 | POST | `/query` | `QueryRequest` | `{session_id, answer, steps, usage}` | Blocking; `usage` carries tokens + latency |
 | POST | `/query/stream` | `QueryRequest` | `text/event-stream` | SSE; persists user + assistant messages when `conversation_id` is bound |
 | POST | `/visualize` | `ChartRequest` | `{chart_b64, columns, row_count}` | Plotly PNG |
@@ -592,29 +931,33 @@ class ApiResponse:  data: Any;  error: Optional[str]
 ```
 frontend/src/
 ├── main.tsx               React DOM root, Tailwind import
-├── App.tsx                Root layout; runs hydration + preference-sync hooks
+├── App.tsx                Root layout; runs hydration + preference-sync hooks; ⌘B sidebar toggle
 ├── index.css              Tailwind directives + custom scrollbar
+├── commands.ts            Slash-command registry consumed by CommandPalette
 ├── api/
-│   └── client.ts          Typed fetch wrappers — connections, conversations,
-│                          preferences, exports, streaming
+│   └── client.ts          Typed fetch wrappers + multi-agent streamQuery callbacks
 ├── store/
-│   └── index.ts           Zustand store + persist middleware (localStorage)
+│   └── index.ts           Zustand + persist middleware (localStorage); sidebarCollapsed slice
 ├── types/
-│   └── index.ts           TypeScript interfaces (Session, AnalysisResult,
-│                          TokenUsage, Conversation, PersistedMessage, ...)
+│   └── index.ts           TS types for legacy + multi-agent payloads
 ├── hooks/
-│   ├── useAnalysis.ts     SSE stream hook — drives a single query run
+│   ├── useAnalysis.ts     SSE stream hook — wires the multi-agent pipeline events
 │   └── useHydrate.ts      useHydrate / useConversationSync / usePreferenceSync
 └── components/
-    ├── Header.tsx          Top bar: title, model picker, provider toggle
-    ├── Sidebar.tsx         Conversations list + new-chat + connection list
-    ├── ConnectionPanel.tsx DB connect / upload form
-    ├── QueryBar.tsx        Natural language input + submit
-    ├── AnalysisCard.tsx    Renders one streamed/persisted analysis
-    ├── EChartCard.tsx      Interactive ECharts wrapper
-    ├── DataTable.tsx       Tabular query result display
-    ├── AgentProgress.tsx   Live tool-call step indicator
-    └── InsightPanel.tsx    Streaming-text panel; renders ↑in ↓out tok · latency
+    ├── Header.tsx           Top bar: branding, segmented Cloud/Local, model picker, status dot
+    ├── Sidebar.tsx          ChatGPT-style nav: New chat / Connect database, conversations
+    │                        bucketed by date, type-grouped connections, search, collapsible
+    ├── CommandPalette.tsx   ⌘K palette — fuzzy-matched slash commands
+    ├── ConnectionPanel.tsx  DB connect / upload form (SQLite / Postgres / CSV / Excel)
+    ├── QueryBar.tsx         Natural-language input + READ-ONLY badge + refusal copy
+    ├── AnalysisCard.tsx     Per-question card; routes between chat-style and dashboard
+    ├── DashboardCanvas.tsx  12-column CSS grid renderer for {layout, visuals} from the Planner
+    ├── KPICard.tsx          Big-number tile (label, value, optional unit / delta / sparkline)
+    ├── InsightSection.tsx   Renders InsightReport (headline, exec summary, findings) + Critic
+    ├── EChartCard.tsx       Interactive ECharts wrapper
+    ├── DataTable.tsx        Tabular query result display
+    ├── AgentProgress.tsx    Live per-stage progress (intent → plan → queries → viz → insight)
+    └── InsightPanel.tsx     Legacy streaming-text panel; renders ↑in ↓out tok · latency
 ```
 
 ### 2.2 Zustand Store (`store/index.ts`)
@@ -673,7 +1016,7 @@ interface AppStore {
 
 ### 2.3 `useAnalysis.ts` — SSE Stream Hook
 
-Drives one streamed query run end-to-end.
+Drives one streamed query run end-to-end. Handles **both** event tracks: the new multi-agent pipeline payloads *and* the legacy chat-style ones, so the UI smoothly degrades when a conversation jumps between simple Q&A and full dashboard intents.
 
 ```typescript
 async function runQuery(question: string): Promise<void>
@@ -683,15 +1026,25 @@ Flow:
 1. `POST /api/v1/query/stream` with `session_id + question + model + provider + conversation_id`
 2. Read `response.body` as `ReadableStream`, split on `\n`, parse `data: {...}` lines
 3. Dispatch to the store based on `event.type`:
-   - `conversation` → `attachServerIds(cardId, conversation_id, assistant_message_id)`; `upsertConversation` if new
-   - `token`        → `appendToken(cardId, content)`
-   - `chart_spec`   → `addChart(cardId, {id, option, title, sql})`
-   - `table_data`   → `addTable(cardId, {id, columns, rows, sql, title})`
-   - `tool_start`/`tool_end` → `addStep(cardId, …)`
-   - `export_ctx`   → `setExportCtx(cardId, sql, session_id)`
-   - `usage`        → `setUsage(cardId, {input_tokens, output_tokens, total_tokens, latency_ms})`
-   - `error`        → `setAnalysisError(cardId, content)`
-   - `done`         → `finalizeAnalysis(cardId)`
+   - `conversation`       → `attachServerIds(cardId, conversation_id, assistant_message_id)`; `upsertConversation` if new
+   - **`intent`**         → `attachIntent(cardId, IntentInfo)` — drives the AgentProgress timeline
+   - **`plan`**           → `attachPlan(cardId, PlanInfo)` — DashboardCanvas reads `layout`
+   - **`query_start`**    → push `QueryProgress {status: 'running'}`
+   - **`query_done`**     → patch `QueryProgress` with rows / latency / repaired / error
+   - **`viz`**            → `addRenderedVisual(cardId, RenderedVisual)`
+   - **`dashboard_layout`** → finalise the layout payload for `DashboardCanvas`
+   - **`insight`**        → `attachInsight(cardId, InsightReport)`
+   - **`critique`**       → `attachCritique(cardId, CritiqueReport)`
+   - `chart_spec`         → `addChart(cardId, {id, option, title, sql})`     # back-compat
+   - `table_data`         → `addTable(cardId, {id, columns, rows, sql, title})` # back-compat
+   - `token`              → `appendToken(cardId, content)`
+   - `tool_start`/`tool_end` → `addStep(cardId, …)`                          # legacy ReAct
+   - `export_ctx`         → `setExportCtx(cardId, sql, session_id)`
+   - `usage`              → `setUsage(cardId, PipelineUsage)` — incl. per-agent latency_ms
+   - `error`              → `setAnalysisError(cardId, content)`
+   - `done`               → `finalizeAnalysis(cardId)`
+
+The hook also calls `setCurrentAbort(controller.abort)` so the **`/stop`** slash command can cancel the in-flight stream.
 
 ### 2.3b `useHydrate.ts` — Bootstrap & Sync Hooks
 
@@ -730,7 +1083,14 @@ api.getPreferences(): Promise<UserPreferences>
 api.updatePreferences(patch): Promise<UserPreferences>
 
 // Streaming + exports
-api.streamQuery(sessionId, question, model, provider, callbacks): () => void
+api.streamQuery(sessionId, question, model, provider, callbacks, conversationId?): () => void
+//   callbacks: {
+//     onConversation, onToken, onChart, onTable, onStep, onExportCtx,
+//     onUsage, onDone, onError,
+//     // Multi-agent pipeline (all optional for back-compat):
+//     onIntent, onPlan, onQueryStart, onQueryDone, onViz, onLayout,
+//     onInsight, onCritique
+//   }
 api.exportCsv  (sessionId, sql, title): Promise<void>     // browser download
 api.exportExcel(sessionId, sql, title): Promise<void>
 api.exportPdf  (sessionId, sql, title): Promise<void>
@@ -750,8 +1110,14 @@ All JSON responses are unwrapped from the `{data, error}` envelope. Errors throw
 | `EChartCard` | `option: EChartsOption`, `title: string` | `<ReactECharts>` wrapper, dark theme, responsive |
 | `DataTable` | `columns: string[]`, `rows: any[][]`, `title: string` | Styled HTML table, max-height scroll |
 | `AgentProgress` | `steps: QueryStep[]` | Tool call timeline with icons |
-| `Sidebar` | reads `sessions[]`, `conversations[]`, `activeSessionId`, `activeConversationId` from the store | ChatGPT-style nav: top-pinned **New chat** button + collapsible **Connect database** panel; conversations are grouped into `Today` / `Yesterday` / `Previous 7 days` / `Older` buckets via `groupByDate(updated_at)`; each row supports inline rename (Enter to commit, Escape to cancel) and confirm-then-delete; connections live in a separate collapsible section beneath the conversation list |
-| `InsightPanel` | `tables: string[]`, `metadata: SessionMeta` | Schema browser; also renders the `↑in ↓out tok · latency` strip |
+| `Sidebar` | reads `sessions[]`, `conversations[]`, `activeSessionId`, `activeConversationId`, `sidebarCollapsed` from the store | ChatGPT-style nav: top-pinned **New chat** button + collapsible **Connect database** panel; conversations bucketed by date (`groupByDate`) — collapsed view shows a flat *Recent 5* list, *Show all* expands into Today / Yesterday / Previous 7 days / Previous 30 days / Older; each row supports inline rename (Enter / Escape) and confirm-then-delete; connections in a separate type-grouped section (SQLite / Postgres / CSV / Excel buckets driven by `TYPE_META`) with per-source-type accent colours and a search input |
+| `Header` | reads `model`, `provider`, `activeSessionId`, `sessions` | Branding with DB-connected status dot + v1.1 pill; segmented Cloud/Local provider control replacing the old dropdown; model selector with status beacon; subtle gradient bottom accent |
+| `CommandPalette` | global ⌘K | Fuzzy-matched slash commands (`/help`, `/clear`, `/new`, `/disconnect`, `/export pdf`, `/model …`, `/provider …`, `/tables`, `/schema`, `/stop`, `/retry`, `/continue`); registry in `src/commands.ts`; keyboard-only nav (↑/↓/Enter/Esc) |
+| `DashboardCanvas` | `title`, `subtitle?`, `layout: LayoutRow[]`, `visuals: RenderedVisual[]` | Renders one CSS-grid row per `LayoutRow`, spanning each visual across `slot.width` of 12 columns; KPIs go through `KPICard`, charts through `<ReactECharts>`, tables through `DataTable` |
+| `KPICard` | `kpi: KPIPayload`, `title?`, `subtitle?`, `previousValue?`, `compact?` | Big-number tile with optional unit, optional delta vs prior value, optional inline sparkline (ECharts) |
+| `InsightSection` | `insight: InsightReport`, `critique?: CritiqueReport \| null` | Renders the structured InsightReport (headline, exec summary, findings, anomalies, recos) as markdown; Critic warnings strip below |
+| `AgentProgress` | `steps: AgentStep[]`, `intentInfo?`, `planInfo?`, `queryProgress?`, `isRunning` | Live per-stage timeline (intent → plan → queries → viz → insight) with per-stage latency; legacy tool-call icons retained for the non-streaming `/query` path |
+| `InsightPanel` | `content: string`, `usage?: PipelineUsage`, `isStreaming?: bool` | Legacy chat-style markdown panel; renders the `↑in ↓out tok · latency` strip |
 
 ### 2.6 TypeScript Types (`types/index.ts`)
 
@@ -809,12 +1175,119 @@ interface AnalysisResult {
 
   exportSql?:       string
   exportSessionId?: string
-  usage?:           TokenUsage       // rendered as "↑X ↓Y tok · Zms" in InsightPanel
+  usage?:           TokenUsage | PipelineUsage
   error?:           string
 
   // Server identifiers — set when the query is bound to a persisted thread
   conversationId?: string
   messageId?:      string
+
+  // Multi-agent pipeline payloads (all optional; absent for chat-style replies)
+  intentInfo?:    IntentInfo
+  planInfo?:      PlanInfo
+  visuals?:       RenderedVisual[]
+  insightReport?: InsightReport
+  critique?:      CritiqueReport
+  queryProgress?: QueryProgress[]
+}
+
+// ── Multi-agent pipeline types (mirror backend Pydantic models) ─────────────
+
+type IntentLabel  = 'greeting' | 'help' | 'simple_qa' | 'metric'
+                  | 'exploration' | 'dashboard' | 'report' | 'comparison'
+type ExportFormat = 'pdf' | 'excel' | 'csv'
+
+interface IntentInfo {
+  intent: IntentLabel
+  wants_chart: boolean
+  wants_dashboard: boolean
+  wants_export: ExportFormat | null
+  chart_hints: string[]
+  time_window: string | null
+  complexity: 'simple' | 'moderate' | 'complex'
+  keywords: string[]
+  confidence: number
+  latency_ms?: number
+}
+
+interface LayoutSlot { visual_id: string; width: number }
+interface LayoutRow  { slots: LayoutSlot[] }
+
+interface PlanInfo {
+  title: string
+  description: string
+  query_count:  number
+  visual_count: number
+  layout: LayoutRow[]
+  latency_ms?: number
+}
+
+interface KPIPayload {
+  label: string
+  value: unknown
+  formatted_value: string
+  unit: string | null
+  sparkline: number[]
+}
+
+interface RenderedVisual {
+  visual_id: string
+  visual_type: string                // "kpi" | "bar" | "line" | "table" | …
+  title: string
+  subtitle: string | null
+  from_query: string
+  kpi: KPIPayload | null
+  echarts_option: Record<string, unknown> | null
+  table_columns: string[]
+  table_rows: unknown[][]
+  rows_count: number
+  error: string | null
+}
+
+interface InsightReport {
+  headline: string
+  executive_summary: string
+  key_findings: string[]
+  anomalies: string[]
+  recommendations: string[]
+  latency_ms?: number
+}
+
+interface CritiqueIssue {
+  severity: 'info' | 'warning' | 'error'
+  category: string
+  message: string
+  location: string | null
+}
+
+interface CritiqueReport {
+  passed: boolean
+  score: number
+  issues: CritiqueIssue[]
+  latency_ms?: number
+}
+
+interface QueryProgress {
+  query_id: string
+  purpose?: string
+  success?: boolean
+  rows_count?: number
+  latency_ms?: number
+  repaired?: boolean
+  error?: string | null
+  status: 'pending' | 'running' | 'done' | 'error'
+}
+
+interface PipelineUsage {
+  input_tokens?:  number              // legacy, not always populated
+  output_tokens?: number
+  total_tokens?:  number
+  latency_ms?:    number
+  // Per-agent breakdown (multi-agent pipeline)
+  intent_latency_ms?:  number
+  plan_latency_ms?:    number
+  insight_latency_ms?: number
+  total_elapsed_ms?:   number
 }
 
 interface Conversation {
@@ -945,3 +1418,14 @@ On first start the FastAPI lifespan (`app.main.lifespan`) will:
 | `CACHE_QUERY_TTL` | `300` | No | Query-result cache TTL (seconds) — reserved for future use |
 | `CACHE_OLLAMA_TTL` | `60` | No | Ollama model-list cache TTL |
 | `APP_SECRET_KEY` | (auto-generated for dev) | **Yes (prod)** | Fernet key (32-byte urlsafe base64) for encrypting Postgres passwords at rest |
+| `MODEL_<ROLE>` / `PROVIDER_<ROLE>` / `MAX_TOKENS_<ROLE>` / `TEMP_<ROLE>` | per-role default | No | Per-agent LLM override. `<ROLE>` ∈ {`INTENT_CLASSIFIER`, `PLANNER`, `SCHEMA`, `SQL_AGENT`, `VIZ_DESIGNER`, `INSIGHT_AGENT`, `CRITIC`}. Empty → fall through to global defaults. See §1.5b. |
+
+### 3.4 Keyboard Shortcuts
+
+| Shortcut | Action |
+|---|---|
+| `Ctrl + B` / `⌘ + B` | Toggle the sidebar (suppressed inside inputs / textareas / `contentEditable`) |
+| `Ctrl + K` / `⌘ + K` | Open the Command Palette |
+| `Enter` | (Command Palette) Run highlighted command · (rename row) Commit · (sidebar conversation) Open |
+| `Escape` | (Command Palette / rename row) Cancel and close |
+| `↑` / `↓` | (Command Palette) Move highlight |

@@ -118,6 +118,15 @@ OPENAPI_TAGS = [
         ),
     },
     {
+        "name": "Reports",
+        "description": (
+            "**Multi-agent report generation.** A single endpoint that runs the entire "
+            "Intent → Planner → SQL Workers → Viz Designer → Insight pipeline and returns "
+            "a fully-composed PDF (cover, KPI strip, charts, tables, insights, SQL appendix) "
+            "or Excel workbook (multi-sheet, native Excel charts, styled summary)."
+        ),
+    },
+    {
         "name": "Conversations",
         "description": (
             "Persistent conversation threads. Each conversation groups a sequence of "

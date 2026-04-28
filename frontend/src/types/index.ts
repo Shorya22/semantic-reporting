@@ -23,10 +23,16 @@ export interface AgentStep {
 }
 
 export interface TokenUsage {
-  input_tokens: number
-  output_tokens: number
-  total_tokens: number
+  input_tokens?: number
+  output_tokens?: number
+  total_tokens?: number
   latency_ms?: number
+  // New per-agent breakdown surfaced by the multi-agent orchestrator.
+  // Old runs / persisted messages won't have these.
+  intent_latency_ms?: number
+  plan_latency_ms?: number
+  insight_latency_ms?: number
+  total_elapsed_ms?: number
 }
 
 export interface ChartResult {
@@ -43,6 +49,106 @@ export interface TableResult {
   sql: string
   title: string
 }
+
+// ---------------------------------------------------------------------------
+// Multi-agent pipeline types (mirror the backend Pydantic models)
+// ---------------------------------------------------------------------------
+
+export type IntentLabel =
+  | 'greeting' | 'help' | 'simple_qa' | 'metric'
+  | 'exploration' | 'dashboard' | 'report' | 'comparison'
+
+export type ExportFormat = 'pdf' | 'excel' | 'csv'
+
+export interface IntentInfo {
+  intent: IntentLabel
+  wants_chart: boolean
+  wants_dashboard: boolean
+  wants_export: ExportFormat | null
+  chart_hints: string[]
+  time_window: string | null
+  complexity: 'simple' | 'moderate' | 'complex'
+  keywords: string[]
+  confidence: number
+  latency_ms?: number
+}
+
+export interface LayoutSlot {
+  visual_id: string
+  width: number
+}
+
+export interface LayoutRow {
+  slots: LayoutSlot[]
+}
+
+export interface PlanInfo {
+  title: string
+  description: string
+  query_count: number
+  visual_count: number
+  layout: LayoutRow[]
+  latency_ms?: number
+}
+
+export interface KPIPayload {
+  label: string
+  value: unknown
+  formatted_value: string
+  unit: string | null
+  sparkline: number[]
+}
+
+export interface RenderedVisual {
+  visual_id: string
+  visual_type: string
+  title: string
+  subtitle: string | null
+  from_query: string
+  kpi: KPIPayload | null
+  echarts_option: Record<string, unknown> | null
+  table_columns: string[]
+  table_rows: unknown[][]
+  rows_count: number
+  error: string | null
+}
+
+export interface InsightReport {
+  headline: string
+  executive_summary: string
+  key_findings: string[]
+  anomalies: string[]
+  recommendations: string[]
+  latency_ms?: number
+}
+
+export interface CritiqueIssue {
+  severity: 'info' | 'warning' | 'error'
+  category: string
+  message: string
+  location: string | null
+}
+
+export interface CritiqueReport {
+  passed: boolean
+  score: number
+  issues: CritiqueIssue[]
+  latency_ms?: number
+}
+
+export interface QueryProgress {
+  query_id: string
+  purpose?: string
+  success?: boolean
+  rows_count?: number
+  latency_ms?: number
+  repaired?: boolean
+  error?: string | null
+  status: 'pending' | 'running' | 'done' | 'error'
+}
+
+/** Alias kept for new multi-agent code clarity; same shape as TokenUsage. */
+export type PipelineUsage = TokenUsage
 
 export interface AnalysisResult {
   id: string
@@ -64,6 +170,15 @@ export interface AnalysisResult {
   // Used to reconcile streamed runs with persisted messages on reload.
   conversationId?: string
   messageId?: string
+
+  // ── Multi-agent pipeline payloads ─────────────────────────────────────
+  // All optional; old/chat-style answers won't have any of these.
+  intentInfo?: IntentInfo
+  planInfo?: PlanInfo
+  visuals?: RenderedVisual[]
+  insightReport?: InsightReport
+  critique?: CritiqueReport
+  queryProgress?: QueryProgress[]
 }
 
 export interface Conversation {
@@ -90,6 +205,9 @@ export interface PersistedMessage {
   status: 'running' | 'done' | 'error'
   error?: string | null
   created_at: string | null
+  visuals?: RenderedVisual[] | null
+  insight_report?: InsightReport | null
+  critique?: CritiqueReport | null
 }
 
 export interface UserPreferences {

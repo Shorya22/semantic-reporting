@@ -1,7 +1,14 @@
 import {
   Conversation,
+  CritiqueReport,
+  InsightReport,
+  IntentInfo,
   ModelOption,
   PersistedMessage,
+  PipelineUsage,
+  PlanInfo,
+  QueryProgress,
+  RenderedVisual,
   Session,
   UserPreferences,
 } from '../types'
@@ -153,6 +160,31 @@ export const api = {
       'application/pdf'
     ),
 
+  downloadReport: (
+    sessionId: string,
+    question: string,
+    format: 'pdf' | 'xlsx',
+    title?: string
+  ) =>
+    downloadBlob(
+      '/report',
+      { session_id: sessionId, question, format, title },
+      `${(title ?? 'report').replace(/\s+/g, '_')}.${format}`,
+      format === 'xlsx'
+        ? 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+        : 'application/pdf'
+    ),
+
+  fetchExampleQueries: async (sessionId: string): Promise<string[]> => {
+    try {
+      const res = await fetch(`${BASE}/sessions/${sessionId}/example-queries`)
+      const json = await res.json() as { data?: { examples?: string[] } }
+      return json?.data?.examples ?? []
+    } catch {
+      return []
+    }
+  },
+
   streamQuery(
     sessionId: string,
     question: string,
@@ -186,14 +218,18 @@ export const api = {
         output?: string
       ) => void
       onExportCtx: (sql: string, sessionId: string) => void
-      onUsage: (u: {
-        input_tokens: number
-        output_tokens: number
-        total_tokens: number
-        latency_ms?: number
-      }) => void
+      onUsage: (u: PipelineUsage) => void
       onDone: () => void
       onError: (msg: string) => void
+      // ── Multi-agent pipeline callbacks (all optional for back-compat)
+      onIntent?:    (info: IntentInfo) => void
+      onPlan?:      (info: PlanInfo)   => void
+      onQueryStart?: (q: QueryProgress) => void
+      onQueryDone?:  (q: QueryProgress) => void
+      onViz?:       (v: RenderedVisual) => void
+      onLayout?:    (info: { title: string; layout: PlanInfo['layout']; visuals: RenderedVisual[] }) => void
+      onInsight?:   (r: InsightReport) => void
+      onCritique?:  (r: CritiqueReport) => void
     },
     conversationId?: string | null
   ): () => void {
@@ -304,12 +340,66 @@ export const api = {
                   break
                 case 'usage':
                   callbacks.onUsage({
-                    input_tokens: (evt.input_tokens as number) ?? 0,
-                    output_tokens: (evt.output_tokens as number) ?? 0,
-                    total_tokens: (evt.total_tokens as number) ?? 0,
-                    latency_ms: (evt.latency_ms as number) ?? 0,
+                    input_tokens:        (evt.input_tokens as number) ?? 0,
+                    output_tokens:       (evt.output_tokens as number) ?? 0,
+                    total_tokens:        (evt.total_tokens as number) ?? 0,
+                    latency_ms:          (evt.latency_ms as number) ?? 0,
+                    intent_latency_ms:   (evt.intent_latency_ms as number) ?? undefined,
+                    plan_latency_ms:     (evt.plan_latency_ms as number) ?? undefined,
+                    insight_latency_ms:  (evt.insight_latency_ms as number) ?? undefined,
+                    total_elapsed_ms:    (evt.total_elapsed_ms as number) ?? undefined,
                   })
                   break
+
+                // ── Multi-agent pipeline events ─────────────────────
+                case 'intent':
+                  callbacks.onIntent?.(evt as unknown as IntentInfo)
+                  break
+                case 'plan':
+                  callbacks.onPlan?.({
+                    title:        (evt.title as string) ?? '',
+                    description:  (evt.description as string) ?? '',
+                    query_count:  (evt.query_count as number) ?? 0,
+                    visual_count: (evt.visual_count as number) ?? 0,
+                    layout:       (evt.layout as PlanInfo['layout']) ?? [],
+                    latency_ms:   (evt.latency_ms as number) ?? undefined,
+                  })
+                  break
+                case 'query_start':
+                  callbacks.onQueryStart?.({
+                    query_id: (evt.query_id as string) ?? '',
+                    purpose:  (evt.purpose as string) ?? undefined,
+                    status:   'running',
+                  })
+                  break
+                case 'query_done':
+                  callbacks.onQueryDone?.({
+                    query_id:   (evt.query_id as string) ?? '',
+                    success:    (evt.success as boolean) ?? false,
+                    rows_count: (evt.rows_count as number) ?? 0,
+                    latency_ms: (evt.latency_ms as number) ?? 0,
+                    repaired:   (evt.repaired as boolean) ?? false,
+                    error:      (evt.error as string | null) ?? null,
+                    status:     evt.success ? 'done' : 'error',
+                  })
+                  break
+                case 'viz':
+                  callbacks.onViz?.(evt as unknown as RenderedVisual)
+                  break
+                case 'dashboard_layout':
+                  callbacks.onLayout?.({
+                    title:   (evt.title as string) ?? '',
+                    layout:  (evt.layout as PlanInfo['layout']) ?? [],
+                    visuals: (evt.visuals as RenderedVisual[]) ?? [],
+                  })
+                  break
+                case 'insight':
+                  callbacks.onInsight?.(evt as unknown as InsightReport)
+                  break
+                case 'critique':
+                  callbacks.onCritique?.(evt as unknown as CritiqueReport)
+                  break
+
                 case 'done':
                   callbacks.onDone()
                   break

@@ -125,6 +125,9 @@ class Message(Base):
     tables_json:     Mapped[list]           = mapped_column(JSON, nullable=False, default=list)
     steps_json:      Mapped[list]           = mapped_column(JSON, nullable=False, default=list)
     usage_json:      Mapped[Optional[dict]] = mapped_column(JSON)
+    visuals_json:    Mapped[Optional[list]] = mapped_column(JSON)
+    insight_json:    Mapped[Optional[dict]] = mapped_column(JSON)
+    critique_json:   Mapped[Optional[dict]] = mapped_column(JSON)
 
     export_sql:      Mapped[Optional[str]]  = mapped_column(Text)
     status:          Mapped[str]            = mapped_column(String(16), nullable=False, default="done")

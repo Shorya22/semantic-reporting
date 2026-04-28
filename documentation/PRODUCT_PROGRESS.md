@@ -1,7 +1,7 @@
 # Product Progress — Semantic Reporting (NL-DB Query)
 
-> Last updated: 2026-04-27
-> Status: **Active Development — Core Feature Complete**
+> Last updated: 2026-04-27 (rev. multi-agent pipeline, defence-in-depth read-only, command palette, dashboard canvas)
+> Status: **Active Development — Multi-Agent Pipeline live**
 
 ---
 
@@ -23,24 +23,32 @@ Semantic Reporting is a natural-language-to-SQL analytics tool. A user connects 
 - [x] **Session management** — UUID-based sessions, list/get/delete, in-memory registry
 - [x] **Schema introspection** — `schema_ddl` extracted on connect, passed to agent as context
 
-#### AI Agent
-- [x] **LangGraph ReAct agent** — autonomous loop: agent_node → tools_node → agent_node
-- [x] **Tool: `execute_sql`** — runs read-only SQL, returns structured rows + pipe table for LLM
-- [x] **Tool: `generate_chart`** — runs SQL, builds ECharts JSON option, returns via sentinel
-- [x] **LLM providers** — Groq Cloud (default) and local Ollama, switchable per request
-- [x] **Model selection** — frontend can override model per query; server falls back to `.env` default
-- [x] **Streaming (SSE)** — real-time token + tool-step events via `astream_events()`
-- [x] **Non-streaming endpoint** — blocking `/query` for programmatic use
-- [x] **Rate limit retry** — exponential back-off (3 retries) on Groq 429/529; immediate fail on daily quota
-- [x] **Graph cache** — one compiled LangGraph per (session × provider × model), evicted on disconnect
-- [x] **Structured data extraction** — sentinel pattern intercepts chart/table JSON from tool results
-- [x] **Export context** — `export_ctx` SSE event carries last SQL + session_id to enable download buttons
-- [x] **Token + latency telemetry** — every `/query` response and SSE `usage` event carries `input_tokens`, `output_tokens`, `total_tokens`, and `latency_ms` (wall-clock). Persisted on assistant messages.
+#### Multi-Agent Pipeline (streaming endpoint)
+- [x] **Orchestrator** (`app/agents/orchestrator.py`) drives 7 specialised agents and emits SSE events at each stage
+- [x] **Intent Classifier** — labels each prompt (`greeting` / `help` / `simple_qa` / `metric` / `exploration` / `dashboard` / `report` / `comparison`); short-circuits trivial branches with no LLM call
+- [x] **Schema Agent** — DDL + per-column profile (cardinality, sample values, ranges); cached in Redis (`cache_schema_ttl`, default 1 day)
+- [x] **Planner** — produces a typed `AnalysisPlan` (parallel queries + planned visuals + 12-column grid layout)
+- [x] **SQL Workers** — parallel `asyncio.gather` execution; one LLM-driven repair-and-retry on failure; results cached for `cache_query_ttl` (5 min); per-query SSE `query_start` / `query_done` events
+- [x] **Viz Designer** — deterministic builder turning `(PlannedVisual, QueryResult)` pairs into KPI / ECharts / table payloads (no LLM call → no hallucinated columns)
+- [x] **Insight Agent** — writes `headline`, `executive_summary`, `key_findings`, `anomalies`, `recommendations`, all grounded in real query rows
+- [x] **Critic** — advisory quality gate (`passed`, `score`, `issues[]`); never blocks delivery
+- [x] **Per-agent LLM config** — `MODEL_*` / `PROVIDER_*` / `MAX_TOKENS_*` / `TEMP_*` for each role, overridable per request via `QueryRequest.model` / `provider`. Cheap roles (intent / viz / critic) use 8B; reasoning roles (planner / insight) use 70B
+- [x] **`llm_factory.llm_for(name, …)`** — single source of truth for LLM construction; per-call override priority over per-role defaults
+- [x] **New SSE events** — `intent`, `plan`, `query_start`, `query_done`, `viz`, `dashboard_layout`, `insight`, `critique`, plus per-agent `latency_ms` accounting in the final `usage` event
+- [x] **Back-compat events** — orchestrator still emits `chart_spec` / `table_data` / `token` / `export_ctx` / `usage` / `done` so older clients keep working
 
-#### Security
-- [x] **SQL read-only guard** — sqlglot AST walk blocks INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, GRANT, REVOKE, MERGE, CALL
-- [x] **Multi-statement block** — `;\s*\S` pattern rejects stacked statements
-- [x] **Keyword fallback** — regex check if sqlglot parse fails (unsupported dialect)
+#### AI Agent (legacy / non-streaming)
+- [x] **LangGraph ReAct agent** retained for `POST /query` (non-streaming) — autonomous loop with `execute_sql` + `generate_chart` tools, sentinel pattern for structured data, exponential back-off on Groq 429/529, graph cache per (session × provider × model)
+- [x] **LLM providers** — Groq Cloud (default) and local Ollama, switchable per request
+- [x] **Streaming (SSE)** — real-time token + tool-step events; new path is via the orchestrator (above)
+- [x] **Token + latency telemetry** — `usage` events carry per-agent `intent_latency_ms` / `plan_latency_ms` / `insight_latency_ms` / `total_elapsed_ms`; persisted on assistant messages
+
+#### Security — defence-in-depth read-only (5 layers)
+- [x] **Layer 1 — Input guardrails** (`app/security/guardrails.py`) — pre-LLM regex check rejects prompt-injection, natural-language destructive intent, and obvious off-topic prompts before any token is spent; deterministic refusal copy
+- [x] **Layer 2 — Agent system prompts** — every LLM is told it is read-only and on-topic
+- [x] **Layer 3 — SQL guard (sqlglot AST)** — hardened: walks every node and blocks INSERT / UPDATE / DELETE / MERGE / DROP / TRUNCATE / ALTER / CREATE / GRANT / REVOKE / CALL even when nested in CTEs/subqueries; `;\s*\S` blocks stacked statements; regex fallback for unparseable dialects
+- [x] **Layer 4 — Engine-level read-only** — SQLite uses `PRAGMA query_only = ON` attached as a connect listener (and applied to the existing pooled connection after CSV/Excel `df.to_sql`); Postgres uses `connect_args.options = "-c default_transaction_read_only=on -c statement_timeout=30000"`
+- [x] **Layer 5 — UI affordances** — `QueryBar` shows a "READ-ONLY" badge and surfaces the deterministic refusal copy on guardrail hits
 - [x] **CORS whitelist** — only `localhost:5173` and `localhost:3000`
 - [x] **Error sanitisation** — exceptions truncated to first line, max 200 chars, before client response
 
@@ -126,7 +134,15 @@ Semantic Reporting is a natural-language-to-SQL analytics tool. A user connects 
 - [x] **Conversation linkage** — `AnalysisResult.conversationId` / `messageId` populated from the first `conversation` SSE event so the streamed run can be reconciled with the persisted message on reload
 - [x] **Hydration hooks** (`hooks/useHydrate.ts`) — `useHydrate` boots `prefs → connections → conversations → messages` in order; `useConversationSync` re-fetches messages on conversation switch; `usePreferenceSync` debounce-pushes pref changes back to `/preferences`
 - [x] **Persisted Zustand prefs** — `model`, `provider`, `activeSessionId`, `activeConversationId` saved to localStorage (`datalens-ai-state` v1) via `zustand/middleware.persist`; large lists are never persisted
-- [x] **ChatGPT-style sidebar** (`components/Sidebar.tsx`) — top-pinned **New chat** button + collapsible **Connect database** panel; conversations bucketed into `Today` / `Yesterday` / `Previous 7 days` / `Older` via `groupByDate(updated_at)`; per-row inline rename (Enter to commit, Escape to cancel) and confirm-then-delete; connections rendered in a separate collapsible section beneath
+- [x] **ChatGPT-style sidebar** (`components/Sidebar.tsx`) — top-pinned **New chat** button + collapsible **Connect database** panel; conversations bucketed into `Today` / `Yesterday` / `Previous 7 days` / `Previous 30 days` / `Older` via `groupByDate(updated_at)`; per-row inline rename (Enter to commit, Escape to cancel) and confirm-then-delete; connections rendered in a separate type-grouped section (SQLite / Postgres / CSV / Excel buckets driven by `TYPE_META`) with per-source-type accent colours and a search input
+- [x] **Collapsible sidebar** — `Ctrl/⌘ + B` toggles the sidebar; edge-tab toggle anchored to the seam slides with the sidebar via `transition-[width]`; `sidebarCollapsed` is part of the persisted Zustand slice so the choice survives refresh
+- [x] **Header v2** — gradient-glow logo with DB-connected status dot, v1.1 version pill, segmented Cloud/Local provider control replacing the old dropdown + redundant badge, model selector with status beacon, subtle gradient bottom accent
+- [x] **Command palette** (`components/CommandPalette.tsx`, `src/commands.ts`) — `Ctrl/⌘ + K` opens a fuzzy-matched slash-command palette: `/help`, `/clear`, `/new`, `/disconnect`, `/export pdf`, `/model …`, `/provider …`, `/tables`, `/schema`, `/stop`, `/retry`, `/continue`. Keyboard-only nav (↑/↓/Enter/Esc)
+- [x] **Dashboard canvas** (`components/DashboardCanvas.tsx`) — renders the Planner's `layout: LayoutRow[]` as a 12-column CSS grid; KPI tiles via `KPICard`, charts via `<ReactECharts>`, tables via `DataTable`. Title + subtitle pulled from `PlanInfo` / `InsightReport`
+- [x] **KPI card** (`components/KPICard.tsx`) — big-number tile with label, formatted value, optional unit, optional delta vs prior period, optional inline ECharts sparkline; compact mode for dense KPI strips
+- [x] **Insight section** (`components/InsightSection.tsx`) — markdown-rendered `InsightReport` (headline, exec summary, findings, anomalies, recommendations) plus optional Critic warnings strip
+- [x] **Live agent timeline** (`AgentProgress.tsx`) — per-stage progress (intent → plan → queries → viz → insight) with per-stage `latency_ms` from the SSE stream
+- [x] **Stop in-flight queries** — `useAnalysis` exposes its `AbortController` via `setCurrentAbort`; `/stop` slash command cancels the stream cleanly
 
 ---
 
@@ -164,12 +180,13 @@ d:\semantic-reporting\
 |---|---|---|---|
 | 1 | No authentication | Medium | Any client on the network can connect/query |
 | 2 | `uploads/` grows unbounded | Low | Uploaded files are never deleted after session ends |
-| 3 | Graph cache has no TTL or size limit | Low | Memory grows with unique (session × model) combinations |
+| 3 | Graph cache has no TTL or size limit | Low | Legacy ReAct agent only; multi-agent pipeline doesn't use a per-(session × model) graph cache |
 | 4 | `box` chart type renders empty data | Low | ECharts boxplot needs pre-computed quartiles; current impl sends empty `data: []` |
 | 5 | Ollama streaming tokens not implemented | Low | Ollama provider works but may not emit per-token SSE events |
-| 6 | `SYNTHESIS_MAX_TOKENS` env var is a no-op | Info | Legacy field kept for `.env` compatibility; synthesize node was removed |
-| 7 | `cache_query_ttl` / `cache_schema_ttl` not yet wired | Info | Cache tier is functional, but only the Ollama model list currently uses it; SQL-result and schema-DDL caches are reserved for future work |
-| 8 | Local fallback cache lacks per-key TTL | Info | When Redis is down, all entries share `cachetools.TTLCache(ttl=600)` — fine for the current 60s/300s use cases |
+| 6 | `SYNTHESIS_MAX_TOKENS` / `AGENT_MAX_ITERATIONS` env vars are no-ops in the multi-agent path | Info | Kept for `.env` compatibility; legacy ReAct uses them, the orchestrator does not |
+| 7 | Local fallback cache lacks per-key TTL | Info | When Redis is down, all entries share `cachetools.TTLCache(ttl=600)` — fine for the current 60s / 300s / 86400s use cases |
+| 8 | Critic is advisory-only | Info | A failing critique surfaces in the UI but never blocks delivery; if a future use case demands hard rejection, gate the `done` event on `critique.passed` |
+| 9 | Repair-retry is single-shot | Info | SQL Workers do exactly one LLM-driven repair attempt on failure; persistent flakiness shows up as `success=false` in the `query_done` event |
 
 ---
 
@@ -179,11 +196,11 @@ d:\semantic-reporting\
 |---|---|---|
 | High | **User authentication** | JWT login, per-user sessions, per-user Preferences row |
 | High | **Upload cleanup** | Delete temp files when the connection is hard-deleted |
-| High | **Wire query-result cache** | Use `cache.set/get` with `query_cache_key(connection_id, sql)` and `cache_query_ttl` to short-circuit repeated identical SQL |
-| Medium | **Schema-DDL cache** | Cache `connection_manager.get_schema_ddl(session_id)` with `cache_schema_ttl` |
-| Medium | **Multi-turn conversation** | Already persisted and replayed in the UI; need backend plumbing to re-feed prior turns into the LangGraph checkpointer keyed on `conversation_id` so the agent has long-term memory |
-| Medium | **Dashboard mode** | Arrange multiple charts in a grid, export as one PDF |
-| Medium | **Schema auto-suggest** | Suggest table names in QueryBar as user types |
+| High | **Multi-turn agent memory** | Conversations are already persisted and replayed in the UI; the orchestrator currently re-runs the pipeline fresh per turn — need to thread the previous `AnalysisPlan` + `QueryResult` payloads back into the Planner so a follow-up like "now break that down by month" can reuse the prior frame |
+| Medium | **PDF / XLSX dashboard composer** | Reuse the Planner's `RenderedVisual[]` + layout to compose a multi-page report without re-asking the LLM (the data shape is already designed for this — see `viz_designer.py` docstring) |
+| Medium | **Hard-rejecting critic** | Optional flag to make `critique.passed = false` block delivery instead of just surfacing warnings |
+| Medium | **Schema auto-suggest** | Suggest table names in QueryBar as user types, sourced from `SchemaContext` |
+| Medium | **Plan editor** | Let the user tweak the Planner's `AnalysisPlan` before SQL Workers run (skip a query, swap a chart type, change layout slot widths) |
 | Low | **Box/violin charts fix** | Pre-compute quartiles server-side for ECharts boxplot |
 | Low | **Ollama streaming fix** | Verify per-token SSE events work with ChatOllama streaming mode |
 | Low | **Connection test button** | Test DB credentials before saving the session |
@@ -196,6 +213,12 @@ d:\semantic-reporting\
 
 | Date | Change |
 |---|---|
+| 2026-04-27 | **End-to-end multi-agent reports — `POST /api/v1/report` (PDF + XLSX).** New `app/services/report_service.py` composes production-grade deliverables from the multi-agent pipeline output. **PDF** (fpdf2, A4 landscape) — dark navy cover with title/question/timestamp, KPI strip page (4 cards w/ accent stripes), Insights page (headline + exec summary + key findings / anomalies / recommendations), one chart per page (rendered via Plotly+Kaleido at 1100×460), per-table page (30-row preview with banded rows), SQL-provenance appendix (per query: id, purpose, status, latency, repaired flag, full SQL). **XLSX** (xlsxwriter) — *Summary* sheet (title, question, KPI tiles via merged-cell shapes, executive summary + key findings / anomalies / recommendations sections), one sheet per non-KPI visual (banded data table + **native Excel chart** sized to the visual type via `_XLSX_CHART_MAP`), *Appendix* sheet (per-query SQL in monospace cells). New `POST /api/v1/report` endpoint — runs the entire Intent → Schema → Planner → SQL Workers → Viz Designer → Insight pipeline (forces `wants_dashboard=True`), then composes the chosen format; typical cold path 45-60s for PDF, ~8s for XLSX after schema cache warms. New OpenAPI tag `Reports`. Used `fpdf2 + xlsxwriter + jinja2` (pure-Python, Windows-friendly) instead of WeasyPrint to avoid GTK/Cairo system deps. Verified end-to-end against the AUA/KUA demo DB: 51 KB PDF (5 pages), 11 KB XLSX (5 sheets, 2 native Excel charts). |
+| 2026-04-27 | **Multi-agent pipeline replaces the single ReAct agent for streaming.** New `app/agents/orchestrator.py` runs 7 specialised agents in sequence: `intent_classifier` → `schema_agent` → `planner` → `sql_workers` (parallel) → `viz_designer` → `insight_agent` → `critic`. SQL Workers fan out via `asyncio.gather` with one LLM-driven repair-and-retry on failure and `cache_query_ttl` result caching. Each role has its own `MODEL_*` / `PROVIDER_*` / `MAX_TOKENS_*` / `TEMP_*` in `.env` resolved through `Settings.agent_config(name)` and `app/agents/llm_factory.llm_for(name, …)` — cheap roles (intent / viz / critic) on llama-3.1-8b-instant, reasoning roles (planner / insight) on llama-3.3-70b-versatile. New SSE event types: `intent`, `plan`, `query_start`, `query_done`, `viz`, `dashboard_layout`, `insight`, `critique`; final `usage` event now carries `intent_latency_ms` / `plan_latency_ms` / `insight_latency_ms` / `total_elapsed_ms`. Back-compat events (`chart_spec` / `table_data` / `token` / `export_ctx`) are still emitted so older clients keep working. Trivial intents (greeting / help) short-circuit with a canned reply and zero LLM cost. Legacy `app/agents/sql_agent.py` retained for `POST /query` (non-streaming). |
+| 2026-04-27 | **Multi-agent UI: dashboard canvas, KPI tiles, insight section, command palette.** New `components/DashboardCanvas.tsx` renders the Planner's `layout: LayoutRow[]` as a 12-column CSS grid; new `components/KPICard.tsx` (big-number tile with unit / delta / sparkline); new `components/InsightSection.tsx` (markdown `InsightReport` + optional Critic warnings); new `components/CommandPalette.tsx` (`Ctrl/⌘ + K` fuzzy-matched slash commands; registry in `src/commands.ts` with `/help`, `/clear`, `/new`, `/disconnect`, `/export pdf`, `/model …`, `/provider …`, `/tables`, `/schema`, `/stop`, `/retry`, `/continue`). New TypeScript types for the pipeline: `IntentInfo`, `PlanInfo`, `LayoutRow`, `KPIPayload`, `RenderedVisual`, `InsightReport`, `CritiqueIssue`, `CritiqueReport`, `QueryProgress`, `PipelineUsage`. `useAnalysis` hook now dispatches the new pipeline events into the store, including a `setCurrentAbort` so `/stop` cancels in-flight streams. `AgentProgress` shows per-stage live progress with per-stage latency. |
+| 2026-04-27 | **Defence-in-depth read-only enforcement (5 layers).** New `app/security/guardrails.py` — pre-LLM regex check rejecting prompt-injection patterns, natural-language destructive intent, and obvious off-topic prompts with deterministic refusal copy (Layer 1). `app/security/sql_guard.py` hardened — tighter sqlglot AST walk, broader DDL/DCL/DML coverage, stronger keyword fallback, clearer block messages (Layer 3). `app/db/manager.py` adds engine-level read-only enforcement (Layer 4): SQLite via `PRAGMA query_only = ON` attached as a connect listener (and applied retroactively to the pooled connection after CSV/Excel `df.to_sql`), Postgres via `connect_args.options = "-c default_transaction_read_only=on -c statement_timeout=30000"`. `frontend/src/components/QueryBar.tsx` now shows a "READ-ONLY" badge + surfaces the guardrail refusal copy (Layer 5). Layer 2 (agent system prompts) is documented in the per-agent files. |
+| 2026-04-27 | **Sidebar v2 + collapsible nav + header redesign.** `components/Sidebar.tsx`: type-grouped connections (SQLite / Postgres / CSV / Excel buckets driven by `TYPE_META` with per-source-type accents and status dots), search input, "Recent 5 + Show all" chat list with collapsed-vs-expanded date bucketing including a new `Previous 30 days` bucket. `App.tsx` + store: `Ctrl/⌘ + B` toggles the sidebar; `sidebarCollapsed` is part of the persisted Zustand slice; edge-tab toggle anchored to the seam slides with the sidebar via `transition-[width]`. `components/Header.tsx`: gradient-glow logo with DB-connected status dot, v1.1 version pill, segmented Cloud/Local provider control replacing the old dropdown + redundant badge, model selector with status beacon, subtle gradient bottom accent. |
+| 2026-04-27 | **`backend/scripts/` utilities.** `seed_aua_kua.py` populates a sample SQLite DB for AUA/KUA fraud-detection demos; `check_data.py` quick row-count audit; README explains usage. |
 | 2026-04-27 | **ChatGPT-style sidebar + lazy connection rehydration + repo-root docker-compose.** `components/Sidebar.tsx` rewritten: New-chat button + collapsible *Connect database* panel pinned to the top, conversations bucketed into Today / Yesterday / Previous 7 days / Older with `groupByDate`, inline rename (Enter / Escape) and confirm-delete on each row, connections moved to a collapsible section below the conversation list. `ConnectionManager._rehydrate()` (called from `is_connected` / `get_db` / `get_metadata`) now lazily re-opens persisted SQLite / Postgres / CSV / Excel sessions from the `connections` table on first hit after a restart — no client-side reconnect needed (closes the previous "Live engine handles still in-process" Known Issue). Repo root now ships `docker-compose.yml` (Redis 7-alpine with healthcheck and named volume) so `docker compose up -d` is enough to switch the cache from in-memory to real Redis; `run.bat` already spins up the same `datalens-redis` container automatically when Docker is available. |
 | 2026-04-27 | **`CACHE_BACKEND` setting — fakeredis for dev/test, real Redis for prod.** New `CACHE_BACKEND` env var (`redis` \| `fakeredis` \| `memory`). `fakeredis>=2.27.0` added to `requirements.txt`; the cache layer now branches on `settings.cache_backend` and skips the network recovery probe when running on fakeredis (`_is_fake = True`). `.env.example` defaults to `fakeredis` so devs get zero-setup caching; production overrides to `redis`. `run.bat` skips the Docker Redis startup when `CACHE_BACKEND=fakeredis`/`memory`, and surfaces the actual error when Docker is installed but Docker Desktop daemon isn't running. `/health` now reports `redis` \| `fakeredis` \| `in-memory`. |
 | 2026-04-27 | **OpenAPI / Swagger documentation overhaul.** Endpoints regrouped into 8 categories (`Meta`, `Models`, `Connections`, `Query`, `Visualization`, `Exports`, `Conversations`, `Preferences`) with rich tag-level descriptions in `app/main.py`. Every endpoint in `app/api/routes.py` and `app/api/conversation_routes.py` now declares an explicit `tags=[...]` and a `responses=` block with realistic success + error examples (200 / 400 / 404 / 422 / 500 / 503). Pydantic schemas (`SQLiteConnectRequest`, `PostgresConnectRequest`, `QueryRequest`, `ChartRequest`, `ExportRequest`, `ConversationCreate`, `ConversationUpdate`, `PreferenceUpdate`) carry multi-example `json_schema_extra` so Swagger UI's "Try it out" picker shows several realistic payloads. Tested: 19 endpoints discovered, 8 tags, 12/12 smoke tests pass. Browse at `http://localhost:8000/docs` (Swagger) or `/redoc` (ReDoc). |

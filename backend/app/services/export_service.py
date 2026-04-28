@@ -12,14 +12,29 @@ target file format.
 from __future__ import annotations
 
 import base64
+import datetime as _dt
 import io
-from typing import Optional
+from typing import Any, Optional
 
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.drawing.image import Image as XLImage
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
+
+
+def _strip_tz(v: Any) -> Any:
+    """Excel/openpyxl can't write tz-aware datetimes — drop the tzinfo.
+
+    PostgreSQL TIMESTAMPTZ columns flow back as ``datetime`` with ``tzinfo``
+    attached, which makes ``openpyxl.cell._writer`` raise
+    ``"Excel does not support timezones in datetimes"`` at save time.
+    """
+    if isinstance(v, _dt.datetime) and v.tzinfo is not None:
+        return v.replace(tzinfo=None)
+    if isinstance(v, _dt.time) and v.tzinfo is not None:
+        return v.replace(tzinfo=None)
+    return v
 
 
 # ---------------------------------------------------------------------------
@@ -79,7 +94,8 @@ def export_excel(
     for ri, row in enumerate(df.itertuples(index=False), 2):
         fill = alt_fill if ri % 2 == 0 else PatternFill()
         for ci, val in enumerate(row, 1):
-            cell = ws.cell(row=ri, column=ci, value=val)
+            # openpyxl rejects tz-aware datetimes; coerce here defensively
+            cell = ws.cell(row=ri, column=ci, value=_strip_tz(val))
             cell.fill      = fill
             cell.border    = cell_bdr
             cell.alignment = Alignment(horizontal="left", vertical="center")

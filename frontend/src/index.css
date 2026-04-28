@@ -2,14 +2,255 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ===========================================================================
+ * Theme tokens.
+ *   Dark theme is the default — its values match the legacy hex colors used
+ *   throughout the codebase, so existing components keep working while new
+ *   components can use the semantic tokens (--app-bg, --surface, etc.).
+ *
+ *   Toggling the theme = setting <html data-theme="light"> / "dark".
+ *   `useTheme()` does that based on store state.
+ * ========================================================================= */
+
+:root,
+:root[data-theme="dark"] {
+  --app-bg:           #060b18;   /* root background */
+  --surface:          #080d1a;   /* sidebar / panels */
+  --surface-elev:     #0c1120;   /* cards / inputs */
+  --surface-deep:     #0a0f1e;   /* chart canvas, modal */
+  --border-subtle:    rgb(30 41 59 / 0.6);
+  --border-default:   rgb(30 41 59 / 0.8);
+
+  --fg:               #e2e8f0;   /* primary text */
+  --fg-muted:         #94a3b8;
+  --fg-faint:         #64748b;
+  --fg-dim:           #475569;
+
+  --accent:           #6366f1;
+  --accent-soft:      rgb(99 102 241 / 0.15);
+
+  --scrollbar:        #334155;
+  --scrollbar-hover:  #475569;
+
+  /* Markdown / prose text inside InsightPanel */
+  --prose-fg:         #cbd5e1;
+}
+
+:root[data-theme="light"] {
+  --app-bg:           #f6f8fc;
+  --surface:          #ffffff;
+  --surface-elev:     #ffffff;
+  --surface-deep:     #f8fafc;
+  --border-subtle:    rgb(226 232 240 / 0.9);
+  --border-default:   rgb(226 232 240);
+
+  --fg:               #0f172a;
+  --fg-muted:         #475569;
+  --fg-faint:         #64748b;
+  --fg-dim:           #94a3b8;
+
+  --accent:           #4f46e5;
+  --accent-soft:      rgb(79 70 229 / 0.10);
+
+  --scrollbar:        #cbd5e1;
+  --scrollbar-hover:  #94a3b8;
+
+  --prose-fg:         #1e293b;
+}
+
+/* ===========================================================================
+ * Selective overrides — translate the most commonly used dark hex/slate
+ * classes into theme-aware ones. This avoids touching every component while
+ * still giving the light theme a fully cohesive look.
+ * ========================================================================= */
+
+:root[data-theme="light"] body { background: var(--app-bg); color: var(--fg); }
+
+/* Layout backgrounds — main containers, sidebar, header use these literal hexes. */
+:root[data-theme="light"] .bg-\[\#060b18\],
+:root[data-theme="light"] .bg-\[\#060b18\]\/95,
+:root[data-theme="light"] .bg-\[\#080d1a\],
+:root[data-theme="light"] .bg-\[\#080d1a\]\/95 { background-color: var(--surface) !important; }
+
+:root[data-theme="light"] .bg-\[\#0c1120\] { background-color: var(--surface-elev) !important; }
+:root[data-theme="light"] .bg-\[\#0a0f1e\] { background-color: var(--surface-deep) !important; }
+
+/* Slate surface tints — keep them present but flip to light grays. */
+:root[data-theme="light"] .bg-slate-950        { background-color: var(--app-bg) !important; }
+:root[data-theme="light"] .bg-slate-900        { background-color: var(--surface-elev) !important; }
+:root[data-theme="light"] .bg-slate-900\/30,
+:root[data-theme="light"] .bg-slate-900\/40,
+:root[data-theme="light"] .bg-slate-900\/60,
+:root[data-theme="light"] .bg-slate-900\/80,
+:root[data-theme="light"] .bg-slate-900\/95   { background-color: rgb(248 250 252 / 0.95) !important; }
+:root[data-theme="light"] .bg-slate-800\/40,
+:root[data-theme="light"] .bg-slate-800\/50,
+:root[data-theme="light"] .bg-slate-800\/60,
+:root[data-theme="light"] .bg-slate-800\/80   { background-color: rgb(241 245 249 / 0.85) !important; }
+:root[data-theme="light"] .bg-slate-800       { background-color: rgb(241 245 249) !important; }
+
+/* Borders — keep weight, flip color. */
+:root[data-theme="light"] .border-slate-700,
+:root[data-theme="light"] .border-slate-700\/40,
+:root[data-theme="light"] .border-slate-700\/60,
+:root[data-theme="light"] .border-slate-800,
+:root[data-theme="light"] .border-slate-800\/40,
+:root[data-theme="light"] .border-slate-800\/60,
+:root[data-theme="light"] .border-slate-800\/80 { border-color: var(--border-default) !important; }
+
+/* Text — invert the primary cascade. */
+:root[data-theme="light"] .text-slate-100 { color: #0f172a !important; }
+:root[data-theme="light"] .text-slate-200 { color: #1e293b !important; }
+:root[data-theme="light"] .text-slate-300 { color: #334155 !important; }
+:root[data-theme="light"] .text-slate-400 { color: #475569 !important; }
+:root[data-theme="light"] .text-slate-500 { color: #64748b !important; }
+:root[data-theme="light"] .text-slate-600 { color: #94a3b8 !important; }
+:root[data-theme="light"] .text-slate-700 { color: #cbd5e1 !important; }
+
+/* Placeholders — make them visible against white. */
+:root[data-theme="light"] .placeholder-slate-600::placeholder { color: #94a3b8 !important; }
+
+/* Reduce neon glow intensity on accent rings/shadows in light mode. */
+:root[data-theme="light"] .shadow-indigo-900\/30,
+:root[data-theme="light"] .shadow-indigo-900\/40,
+:root[data-theme="light"] .shadow-indigo-500\/20,
+:root[data-theme="light"] .shadow-indigo-700\/40 { --tw-shadow-color: rgb(79 70 229 / 0.18) !important; }
+
+/* ===========================================================================
+ * Light-theme overrides — second pass.
+ * Targets the colored "*-900/X" tinted backgrounds and the dark gradient
+ * stops used in InsightSection / DashboardCanvas / KPI cards / status pills.
+ * ========================================================================= */
+
+/* Indigo / emerald / amber / red tinted surfaces (status pills, callouts) */
+:root[data-theme="light"] .bg-indigo-900\/20,
+:root[data-theme="light"] .bg-indigo-900\/30,
+:root[data-theme="light"] .bg-indigo-900\/40,
+:root[data-theme="light"] .bg-indigo-900\/50  { background-color: rgb(238 242 255 / 0.85) !important; } /* indigo-50 */
+:root[data-theme="light"] .text-indigo-200,
+:root[data-theme="light"] .text-indigo-300,
+:root[data-theme="light"] .text-indigo-400    { color: #4338ca !important; }                          /* indigo-700 */
+:root[data-theme="light"] .border-indigo-700\/30,
+:root[data-theme="light"] .border-indigo-700\/40,
+:root[data-theme="light"] .border-indigo-600\/50,
+:root[data-theme="light"] .border-indigo-500\/30,
+:root[data-theme="light"] .border-indigo-500\/40 { border-color: rgb(165 180 252 / 0.9) !important; }  /* indigo-300 */
+
+:root[data-theme="light"] .bg-emerald-900\/20,
+:root[data-theme="light"] .bg-emerald-900\/30,
+:root[data-theme="light"] .bg-emerald-500\/15  { background-color: rgb(236 253 245 / 0.9) !important; } /* emerald-50 */
+:root[data-theme="light"] .text-emerald-200,
+:root[data-theme="light"] .text-emerald-300,
+:root[data-theme="light"] .text-emerald-400    { color: #047857 !important; }                          /* emerald-700 */
+:root[data-theme="light"] .border-emerald-700\/30,
+:root[data-theme="light"] .border-emerald-700\/40,
+:root[data-theme="light"] .border-emerald-500\/30,
+:root[data-theme="light"] .ring-emerald-500\/30 { border-color: rgb(110 231 183 / 0.85) !important; }   /* emerald-300 */
+:root[data-theme="light"] .ring-emerald-500\/30 { --tw-ring-color: rgb(110 231 183 / 0.85) !important; }
+
+:root[data-theme="light"] .bg-amber-900\/20,
+:root[data-theme="light"] .bg-amber-900\/30,
+:root[data-theme="light"] .bg-amber-500\/15    { background-color: rgb(255 251 235 / 0.9) !important; } /* amber-50 */
+:root[data-theme="light"] .text-amber-200,
+:root[data-theme="light"] .text-amber-300,
+:root[data-theme="light"] .text-amber-400      { color: #b45309 !important; }                          /* amber-700 */
+:root[data-theme="light"] .border-amber-700\/30,
+:root[data-theme="light"] .border-amber-700\/40,
+:root[data-theme="light"] .border-amber-500\/30 { border-color: rgb(252 211 77 / 0.85) !important; }   /* amber-300 */
+
+:root[data-theme="light"] .bg-red-900\/20,
+:root[data-theme="light"] .bg-red-900\/30,
+:root[data-theme="light"] .bg-red-900\/40      { background-color: rgb(254 242 242 / 0.9) !important; } /* red-50 */
+:root[data-theme="light"] .text-red-200,
+:root[data-theme="light"] .text-red-300,
+:root[data-theme="light"] .text-red-400        { color: #b91c1c !important; }                          /* red-700 */
+:root[data-theme="light"] .border-red-700\/30,
+:root[data-theme="light"] .border-red-800\/40  { border-color: rgb(252 165 165 / 0.85) !important; }   /* red-300 */
+
+:root[data-theme="light"] .bg-sky-500\/15      { background-color: rgb(240 249 255 / 0.9) !important; }
+:root[data-theme="light"] .text-sky-300        { color: #0369a1 !important; }
+:root[data-theme="light"] .ring-sky-500\/40    { --tw-ring-color: rgb(125 211 252 / 0.85) !important; }
+
+:root[data-theme="light"] .bg-green-500\/15    { background-color: rgb(240 253 244 / 0.9) !important; }
+:root[data-theme="light"] .text-green-300      { color: #15803d !important; }
+:root[data-theme="light"] .ring-green-500\/40  { --tw-ring-color: rgb(134 239 172 / 0.85) !important; }
+
+/* Dark gradient stops used by InsightSection and KPI / Dashboard panels */
+:root[data-theme="light"] .from-indigo-950\/20 { --tw-gradient-from: rgb(238 242 255 / 0.6) var(--tw-gradient-from-position) !important;
+                                                  --tw-gradient-to: rgb(238 242 255 / 0) var(--tw-gradient-to-position) !important;
+                                                  --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+:root[data-theme="light"] .to-slate-900\/60    { --tw-gradient-to: rgb(248 250 252 / 0.6) var(--tw-gradient-to-position) !important; }
+:root[data-theme="light"] .to-slate-900\/40    { --tw-gradient-to: rgb(248 250 252 / 0.4) var(--tw-gradient-to-position) !important; }
+:root[data-theme="light"] .from-slate-900\/80,
+:root[data-theme="light"] .from-slate-900\/60,
+:root[data-theme="light"] .from-slate-900\/40 { --tw-gradient-from: rgb(255 255 255) var(--tw-gradient-from-position) !important;
+                                                 --tw-gradient-to: rgb(255 255 255 / 0) var(--tw-gradient-to-position) !important;
+                                                 --tw-gradient-stops: var(--tw-gradient-from), var(--tw-gradient-to) !important; }
+
+/* Indigo brand-accent gradients (New Chat button, logo) — keep them
+ * vivid in light mode but not too saturated.                         */
+:root[data-theme="light"] .from-indigo-500   { --tw-gradient-from: #6366f1 var(--tw-gradient-from-position) !important; }
+:root[data-theme="light"] .to-purple-600,
+:root[data-theme="light"] .to-indigo-500,
+:root[data-theme="light"] .to-indigo-400     { --tw-gradient-to: #6366f1 var(--tw-gradient-to-position) !important; }
+:root[data-theme="light"] .from-indigo-600   { --tw-gradient-from: #4f46e5 var(--tw-gradient-from-position) !important; }
+:root[data-theme="light"] .via-indigo-600    { --tw-gradient-via: #4f46e5 var(--tw-gradient-via-position) !important; }
+:root[data-theme="light"] .to-purple-600     { --tw-gradient-to: #7c3aed var(--tw-gradient-to-position) !important; }
+
+/* TailwindCSS Typography "prose-invert" — invert it back for light mode.
+ * The simplest way: redirect every prose-invert variable to its light
+ * counterpart so the existing markup keeps working.                  */
+:root[data-theme="light"] .prose-invert {
+  --tw-prose-invert-body:        #1e293b;   /* slate-800 */
+  --tw-prose-invert-headings:    #0f172a;   /* slate-900 */
+  --tw-prose-invert-lead:        #334155;
+  --tw-prose-invert-links:       #4f46e5;
+  --tw-prose-invert-bold:        #0f172a;
+  --tw-prose-invert-counters:    #64748b;
+  --tw-prose-invert-bullets:     #cbd5e1;
+  --tw-prose-invert-hr:          #e2e8f0;
+  --tw-prose-invert-quotes:      #1e293b;
+  --tw-prose-invert-quote-borders: #cbd5e1;
+  --tw-prose-invert-captions:    #64748b;
+  --tw-prose-invert-code:        #4338ca;
+  --tw-prose-invert-pre-code:    #1e293b;
+  --tw-prose-invert-pre-bg:      #f1f5f9;   /* slate-100 */
+  --tw-prose-invert-th-borders:  #cbd5e1;
+  --tw-prose-invert-td-borders:  #e2e8f0;
+}
+
+/* Ring helpers — keep ring colors visible against white */
+:root[data-theme="light"] .ring-indigo-500\/30,
+:root[data-theme="light"] .ring-indigo-500\/40,
+:root[data-theme="light"] .ring-indigo-500\/50 { --tw-ring-color: rgb(165 180 252 / 0.9) !important; }
+
+/* Hover backgrounds — slate-700 used inside buttons */
+:root[data-theme="light"] .hover\:bg-slate-700:hover    { background-color: rgb(241 245 249) !important; }
+:root[data-theme="light"] .hover\:bg-slate-800:hover,
+:root[data-theme="light"] .hover\:bg-slate-800\/40:hover,
+:root[data-theme="light"] .hover\:bg-slate-800\/50:hover,
+:root[data-theme="light"] .hover\:bg-slate-800\/60:hover { background-color: rgb(241 245 249 / 0.85) !important; }
+
+/* Subtle indigo-tinted hover (chat row "active" gradient) — keep it but
+ * lighten so it's a soft highlight on white instead of a glow on black. */
+:root[data-theme="light"] .from-indigo-600\/20 { --tw-gradient-from: rgb(99 102 241 / 0.10) var(--tw-gradient-from-position) !important; }
+:root[data-theme="light"] .via-indigo-600\/10  { --tw-gradient-via:  rgb(99 102 241 / 0.05) var(--tw-gradient-via-position) !important; }
+
+/* Inset shadows look heavy on white — soften them */
+:root[data-theme="light"] .shadow-inner.shadow-black\/20,
+:root[data-theme="light"] .shadow-inner.shadow-black\/30,
+:root[data-theme="light"] .shadow-inner.shadow-black\/40 { --tw-shadow-color: rgb(15 23 42 / 0.04) !important; }
+
 @layer base {
   * {
     box-sizing: border-box;
   }
 
   body {
-    @apply bg-slate-950 text-slate-200 antialiased;
+    background: var(--app-bg);
+    color: var(--fg);
     font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
   }
 
   ::-webkit-scrollbar {
@@ -18,15 +259,16 @@
   }
 
   ::-webkit-scrollbar-track {
-    @apply bg-transparent;
+    background: transparent;
   }
 
   ::-webkit-scrollbar-thumb {
-    @apply bg-slate-700 rounded-full;
+    background: var(--scrollbar);
+    border-radius: 9999px;
   }
 
   ::-webkit-scrollbar-thumb:hover {
-    @apply bg-slate-600;
+    background: var(--scrollbar-hover);
   }
 }
 

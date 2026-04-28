@@ -400,6 +400,49 @@ class ExportRequest(BaseModel):
     }
 
 
+class ReportRequest(BaseModel):
+    """Payload for the /report endpoint — runs the full multi-agent pipeline
+    and returns a fully-composed PDF or XLSX deliverable.
+    """
+
+    session_id: str = Field(..., description="UUID of the active database session.")
+    question: str = Field(
+        ..., min_length=1,
+        description="Natural-language question that drives the analysis.",
+    )
+    format: Literal["pdf", "xlsx"] = Field(
+        default="pdf",
+        description="Output file format. `pdf` = landscape A4 deliverable; `xlsx` = multi-sheet workbook.",
+    )
+    title: Optional[str] = Field(
+        default=None,
+        description="Override the report title (defaults to the planner's auto-generated title).",
+    )
+
+    model_config = {
+        "json_schema_extra": {
+            "examples": [
+                {
+                    "summary": "Generate a PDF dashboard report",
+                    "value": {
+                        "session_id": "8f3c1b2a-9e6d-4d8f-9c45-1b9a7e3f0c12",
+                        "question":   "Give me a complete performance overview of all AUAs",
+                        "format":     "pdf",
+                    },
+                },
+                {
+                    "summary": "Generate an Excel report with native charts",
+                    "value": {
+                        "session_id": "8f3c1b2a-9e6d-4d8f-9c45-1b9a7e3f0c12",
+                        "question":   "Show monthly KYC volume by KYC type",
+                        "format":     "xlsx",
+                    },
+                },
+            ]
+        }
+    }
+
+
 class ChartRequest(BaseModel):
     """Payload for the /visualize endpoint."""
 

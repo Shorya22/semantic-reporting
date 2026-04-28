@@ -27,6 +27,8 @@ from fastapi import APIRouter, HTTPException, UploadFile, File
 from fastapi.responses import Response, StreamingResponse
 import aiofiles
 
+from app.agents.llm_factory import llm_for
+from app.agents.orchestrator import run_orchestrator
 from app.agents.sql_agent import evict_session_agents, run_query, stream_query
 from app.api.schemas import (
     ApiResponse,
@@ -34,6 +36,7 @@ from app.api.schemas import (
     ExportRequest,
     PostgresConnectRequest,
     QueryRequest,
+    ReportRequest,
     SQLiteConnectRequest,
 )
 from app.cache import cache
@@ -519,6 +522,99 @@ def disconnect(session_id: str) -> dict:
 
 
 @router.get(
+    "/connections/{session_id}/example-queries",
+    tags=["Connections"],
+    response_model=ApiResponse,
+    summary="Generate schema-aware example queries for a session",
+    description=(
+        "Uses the connected database's schema to generate 4 natural-language example "
+        "questions the user could ask. Results are cached per session.\n\n"
+        "The frontend uses this to populate the empty-state suggestions panel."
+    ),
+    responses={
+        200: {
+            "description": "Example queries generated.",
+            "content": {
+                "application/json": {
+                    "example": {
+                        "data": [
+                            "Show me the top 10 AUAs by transaction volume this month",
+                            "What is the overall authentication success rate?",
+                            "Give me a monthly trend of KYC transactions",
+                            "Compare success rates between FINGER and IRIS biometric modes",
+                        ],
+                        "error": None,
+                    }
+                }
+            },
+        },
+        404: ERR_404_SESSION,
+    },
+)
+async def get_example_queries(session_id: str) -> dict:
+    """Generate 4 schema-aware example questions using the connected DB schema."""
+    if not connection_manager.is_connected(session_id):
+        raise HTTPException(status_code=404, detail=f"Session '{session_id}' not found.")
+
+    cache_key = f"examples:{session_id}"
+    cached = await cache.aget(cache_key)
+    if cached is not None:
+        return {"data": cached, "error": None}
+
+    # Build schema DDL for the prompt
+    meta = connection_manager.get_metadata(session_id)
+    schema_ddl: str = meta.get("schema_ddl") or ""
+
+    _EXAMPLE_SYSTEM = """\
+You are a data analyst. Given a database schema, generate exactly 4 distinct
+natural-language questions a business user might ask. The questions should:
+- Cover different intent types: 1 single-metric KPI, 1 trend, 1 ranking, 1 comparison or overview
+- Be specific to the actual tables and columns in the schema
+- Be phrased as a business user would ask (no SQL jargon)
+- Be answerable with a SELECT query only
+
+Output ONLY a JSON array of 4 strings. No prose, no markdown, no numbering.
+Example: ["How many transactions happened today?", "Show monthly trends", ...]
+"""
+    _EXAMPLE_USER = f"## Schema\n\n{schema_ddl[:6000]}\n\nGenerate 4 example questions."
+
+    import json as _json
+    from langchain_core.messages import HumanMessage, SystemMessage
+
+    examples: list[str] = []
+    try:
+        llm = llm_for("intent_classifier")  # fast/cheap model is fine here
+        resp = await llm.ainvoke([
+            SystemMessage(content=_EXAMPLE_SYSTEM),
+            HumanMessage(content=_EXAMPLE_USER),
+        ])
+        raw = str(resp.content).strip()
+        # Strip markdown fences if the model wrapped with ```json
+        if raw.startswith("```"):
+            first_bracket = raw.find("[")
+            last_bracket = raw.rfind("]")
+            if first_bracket != -1 and last_bracket != -1:
+                raw = raw[first_bracket:last_bracket + 1]
+        parsed = _json.loads(raw)
+        if isinstance(parsed, list):
+            examples = [str(q).strip() for q in parsed if str(q).strip()][:6]
+    except Exception:
+        pass
+
+    # Fallback: generic examples that work for most databases
+    if len(examples) < 2:
+        examples = [
+            "How many total records are in the database?",
+            "Show me the row counts for each table",
+            "What are the most recent 10 entries?",
+            "Give me a summary overview of the data",
+        ]
+
+    await cache.aset(cache_key, examples, ttl=settings.cache_schema_ttl)
+    return {"data": examples, "error": None}
+
+
+@router.get(
     "/connections/{session_id}/tables",
     tags=["Connections"],
     response_model=ApiResponse,
@@ -642,32 +738,48 @@ async def query(req: QueryRequest) -> dict:
 @router.post(
     "/query/stream",
     tags=["Query"],
-    summary="Run a NL query (Server-Sent Events)",
+    summary="Run a NL query (Server-Sent Events, multi-agent pipeline)",
     description=(
-        "Streams the agent response as `text/event-stream`. Each line is `data: <json>\\n\\n`. "
-        "When `conversation_id` is supplied (or auto-created), the user prompt and "
-        "assistant reply are persisted to the conversation thread.\n\n"
-        "### Event types\n"
+        "Streams the **multi-agent** response as `text/event-stream`. Each line is "
+        "`data: <json>\\n\\n`. When `conversation_id` is supplied (or auto-created), "
+        "the user prompt and assistant reply are persisted to the conversation thread.\n\n"
+        "### Multi-agent pipeline events (in roughly this order)\n\n"
         "| `type` | Meaning |\n"
         "|---|---|\n"
-        "| `conversation` | First event; carries the resolved conversation + message IDs |\n"
-        "| `token`        | A partial token of the final answer — concatenate to render |\n"
-        "| `tool_start`   | The agent is about to call a tool (`execute_sql` or `generate_chart`) |\n"
-        "| `tool_end`     | A tool returned; `output` is the truncated stringified result |\n"
-        "| `chart_spec`   | An ECharts JSON option object — render with `echarts-for-react` |\n"
-        "| `table_data`   | A structured query result `{columns, rows, sql, title}` |\n"
-        "| `export_ctx`   | Last SQL + session_id — enable CSV/Excel/PDF download buttons |\n"
-        "| `usage`        | `{input_tokens, output_tokens, total_tokens, latency_ms}` |\n"
+        "| `conversation` | First event — resolved conversation + assistant message IDs |\n"
+        "| `intent`       | Intent Classifier output: `{intent, wants_chart, wants_dashboard, wants_export, complexity, …}` |\n"
+        "| `plan`         | Planner output: `{title, description, query_count, visual_count, layout}` |\n"
+        "| `query_start`  | Per planned query: `{query_id, purpose}` |\n"
+        "| `query_done`   | Per planned query: `{query_id, success, rows_count, latency_ms, repaired, error}` |\n"
+        "| `viz`          | Per visual: `{visual_id, visual_type, title, kpi?, echarts_option?, table_columns?, table_rows?}` |\n"
+        "| `dashboard_layout` | Final layout: `{title, layout, visuals}` for the DashboardCanvas |\n"
+        "| `insight`      | Insight Agent: `{headline, executive_summary, key_findings, anomalies, recommendations}` |\n"
+        "| `critique`     | Critic (advisory): `{passed, score, issues[]}` |\n"
+        "| `usage`        | Per-agent latency breakdown: `{intent_latency_ms, plan_latency_ms, insight_latency_ms, total_elapsed_ms}` |\n"
         "| `done`         | Stream is complete |\n"
         "| `error`        | Something went wrong — `content` holds the message |\n\n"
-        "### Example stream (truncated)\n"
+        "### Backwards-compat events (also emitted for existing chat-style UIs)\n\n"
+        "| `type` | Meaning |\n"
+        "|---|---|\n"
+        "| `token`      | Token of the executive summary — concatenate to render |\n"
+        "| `chart_spec` | ECharts JSON option object — render with `echarts-for-react` |\n"
+        "| `table_data` | Structured query result `{columns, rows, sql, title}` |\n"
+        "| `export_ctx` | Last SQL + session_id — enables CSV/Excel/PDF download buttons |\n\n"
+        "### Trivial branches (greeting / help)\n\n"
+        "When the Intent Classifier short-circuits the question as `greeting` or `help`, "
+        "the stream emits the `intent` event followed by a canned reply via `token` events "
+        "and `done`. No planner/SQL/insight/critique events are produced.\n\n"
+        "### Example stream excerpt for a dashboard question\n"
         "```\n"
-        "data: {\"type\":\"conversation\",\"conversation_id\":\"c-1\",\"assistant_message_id\":\"m-2\"}\n\n"
-        "data: {\"type\":\"tool_start\",\"tool\":\"execute_sql\",\"input\":\"sql=SELECT ...\"}\n\n"
-        "data: {\"type\":\"tool_end\",\"tool\":\"execute_sql\",\"output\":\"category | total ...\"}\n\n"
-        "data: {\"type\":\"token\",\"content\":\"The top \"}\n\n"
-        "data: {\"type\":\"token\",\"content\":\"5 categories ...\"}\n\n"
-        "data: {\"type\":\"usage\",\"input_tokens\":2341,\"output_tokens\":187,\"total_tokens\":2528,\"latency_ms\":4823}\n\n"
+        "data: {\"type\":\"intent\",\"intent\":\"dashboard\",\"complexity\":\"complex\",\"wants_chart\":true,\"wants_dashboard\":true}\n\n"
+        "data: {\"type\":\"plan\",\"title\":\"AUA Performance Overview\",\"query_count\":4,\"visual_count\":5}\n\n"
+        "data: {\"type\":\"query_start\",\"query_id\":\"q1\",\"purpose\":\"Total transactions\"}\n\n"
+        "data: {\"type\":\"query_done\",\"query_id\":\"q1\",\"success\":true,\"rows_count\":1,\"latency_ms\":312}\n\n"
+        "data: {\"type\":\"viz\",\"visual_id\":\"v1\",\"visual_type\":\"kpi\",\"title\":\"Total Transactions\",\"kpi\":{\"formatted_value\":\"500K\"}}\n\n"
+        "data: {\"type\":\"dashboard_layout\",\"title\":\"AUA Performance Overview\",\"layout\":[…],\"visuals\":[…]}\n\n"
+        "data: {\"type\":\"insight\",\"headline\":\"AUAs perform consistently above 92% success rate\",\"key_findings\":[…]}\n\n"
+        "data: {\"type\":\"critique\",\"passed\":true,\"score\":0.95,\"issues\":[]}\n\n"
+        "data: {\"type\":\"usage\",\"intent_latency_ms\":420,\"plan_latency_ms\":2900,\"insight_latency_ms\":1700,\"total_elapsed_ms\":11800}\n\n"
         "data: {\"type\":\"done\"}\n\n"
         "```"
     ),
@@ -726,14 +838,22 @@ async def query_stream(req: QueryRequest) -> StreamingResponse:
         usage: dict | None = None
         export_sql: str | None = None
         error_msg: str | None = None
+        visuals: list[dict] = []
+        insight_report: dict | None = None
+        critique: dict | None = None
 
         try:
             if conversation_id:
                 yield f"data: {json.dumps({'type': 'conversation', 'conversation_id': conversation_id, 'user_message_id': (user_message or {}).get('id'), 'assistant_message_id': assistant_message_id, 'title': conversation.get('title') if conversation else None})}\n\n"
 
-            async for event in stream_query(
-                db, req.question, req.model, req.provider,
-                session_id=req.session_id, schema_ddl=schema_ddl,
+            # Multi-agent orchestrator emits the new event types
+            # (intent / plan / query_* / viz / dashboard_layout / insight /
+            # critique) AND the back-compat ones (chart_spec / table_data /
+            # token / export_ctx / usage) so existing frontends keep working.
+            async for event in run_orchestrator(
+                question=req.question,
+                db=db,
+                session_id=req.session_id,
             ):
                 etype = event.get("type")
                 if etype == "token":
@@ -753,21 +873,32 @@ async def query_stream(req: QueryRequest) -> StreamingResponse:
                         "sql":     event.get("sql", ""),
                         "title":   event.get("title", "Query Result"),
                     })
-                elif etype in ("tool_start", "tool_end"):
+                elif etype in ("query_start", "query_done"):
+                    # Map new agent-step events into the persisted "steps"
+                    # so message history shows the multi-agent flow too.
                     steps.append({
                         "type":   etype,
-                        "tool":   event.get("tool"),
-                        "input":  event.get("input"),
-                        "output": event.get("output"),
+                        "tool":   event.get("query_id"),
+                        "input":  event.get("purpose"),
+                        "output": (f"rows={event.get('rows_count')} "
+                                   f"latency={event.get('latency_ms')}ms"
+                                   if etype == "query_done" else None),
                     })
+                elif etype == "viz":
+                    v = {k: v for k, v in event.items() if k != "type"}
+                    visuals.append(v)
+                elif etype == "insight":
+                    insight_report = {k: v for k, v in event.items() if k != "type"}
+                elif etype == "critique":
+                    critique = {k: v for k, v in event.items() if k != "type"}
                 elif etype == "export_ctx":
                     export_sql = event.get("sql") or export_sql
                 elif etype == "usage":
                     usage = {
-                        "input_tokens":  event.get("input_tokens", 0),
-                        "output_tokens": event.get("output_tokens", 0),
-                        "total_tokens":  event.get("total_tokens", 0),
-                        "latency_ms":    event.get("latency_ms", 0),
+                        "intent_latency_ms":  event.get("intent_latency_ms", 0),
+                        "plan_latency_ms":    event.get("plan_latency_ms", 0),
+                        "insight_latency_ms": event.get("insight_latency_ms", 0),
+                        "total_elapsed_ms":   event.get("total_elapsed_ms", 0),
                     }
 
                 yield f"data: {json.dumps(event)}\n\n"
@@ -793,6 +924,9 @@ async def query_stream(req: QueryRequest) -> StreamingResponse:
                         status="error" if error_msg else "done",
                         error=error_msg,
                         message_id=assistant_message_id,
+                        visuals=visuals or None,
+                        insight_report=insight_report,
+                        critique=critique,
                     )
                 except Exception:  # noqa: BLE001
                     pass
@@ -1012,3 +1146,128 @@ async def export_pdf(req: ExportRequest) -> Response:
         media_type="application/pdf",
         headers={"Content-Disposition": f'attachment; filename="{req.title}.pdf"'},
     )
+
+
+# =============================================================================
+# Multi-agent reports — POST /report
+# =============================================================================
+
+
+@router.post(
+    "/report",
+    tags=["Reports"],
+    summary="Generate a full multi-agent report (PDF or XLSX)",
+    description=(
+        "Runs the **complete multi-agent pipeline** end-to-end (Intent -> Planner -> "
+        "parallel SQL Workers -> Viz Designer -> Insight) and returns a "
+        "production-grade deliverable.\n\n"
+        "* `format=pdf`  -> landscape A4 with cover, KPI strip, charts, tables, "
+        "insights and SQL appendix\n"
+        "* `format=xlsx` -> multi-sheet workbook with native Excel charts and a "
+        "styled summary sheet\n\n"
+        "Generation typically takes 15-60 seconds depending on plan size and Groq latency."
+    ),
+    responses={
+        200: {
+            "description": "Report generated.",
+            "content": {
+                "application/pdf": {"schema": {"type": "string", "format": "binary"}},
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {
+                    "schema": {"type": "string", "format": "binary"},
+                },
+            },
+        },
+        404: ERR_404_SESSION,
+        422: ERR_422_VALIDATION,
+        500: {
+            "description": "Pipeline failure (planner / workers / composer).",
+            "content": {
+                "application/json": {
+                    "example": {"detail": "Report generation failed: <reason>"}
+                }
+            },
+        },
+    },
+)
+async def generate_report(req: ReportRequest) -> Response:
+    """Run the full multi-agent pipeline and return a PDF/XLSX deliverable."""
+    if not connection_manager.is_connected(req.session_id):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Session '{req.session_id}' not found.",
+        )
+
+    db = connection_manager.get_db(req.session_id)
+
+    # Lazy imports — keep module import time low and decouple from /query path
+    from app.agents.intent_classifier import classify_intent
+    from app.agents.planner import plan_analysis
+    from app.agents.schema_agent import get_schema_context
+    from app.agents.sql_workers import run_planned_queries
+    from app.agents.viz_designer import design_all_visuals
+    from app.agents.insight_agent import generate_insights
+    from app.services.report_service import compose_pdf_report, compose_xlsx_report
+
+    try:
+        intent = await classify_intent(req.question)
+        # Force dashboard intent for report generation — even if the user
+        # phrased the question casually, the report must be a full deliverable.
+        intent = intent.model_copy(update={
+            "wants_dashboard": True,
+            "wants_export": req.format,
+            "complexity": "complex" if intent.complexity != "complex" else intent.complexity,
+        })
+
+        schema = await get_schema_context(req.session_id, db)
+        plan = await plan_analysis(req.question, intent, schema.ddl)
+        if req.title:
+            plan = plan.model_copy(update={"title": req.title})
+
+        if not plan.queries:
+            raise HTTPException(
+                status_code=500,
+                detail="Planner could not generate any executable queries for this question.",
+            )
+
+        results = await run_planned_queries(plan, db, schema, session_id=req.session_id)
+        visuals = design_all_visuals(plan.visuals, results)
+        insight = await generate_insights(req.question, intent, plan, results)
+
+        loop = asyncio.get_event_loop()
+        if req.format == "xlsx":
+            data = await loop.run_in_executor(
+                None,
+                lambda: compose_xlsx_report(
+                    question=req.question, plan=plan, results=results,
+                    visuals=visuals, insight=insight,
+                ),
+            )
+            filename = f"{(req.title or plan.title or 'report').strip().replace(' ', '_')}.xlsx"
+            return Response(
+                content=data,
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
+
+        # PDF (default)
+        data = await loop.run_in_executor(
+            None,
+            lambda: compose_pdf_report(
+                question=req.question, plan=plan, results=results,
+                visuals=visuals, insight=insight,
+            ),
+        )
+        filename = f"{(req.title or plan.title or 'report').strip().replace(' ', '_')}.pdf"
+        return Response(
+            content=data,
+            media_type="application/pdf",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Report generation failed: {str(exc).splitlines()[0][:300]}",
+        ) from exc

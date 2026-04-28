@@ -5,9 +5,15 @@ import {
   AgentStep,
   ChartResult,
   Conversation,
+  CritiqueReport,
+  InsightReport,
+  IntentInfo,
   LlmProvider,
   ModelOption,
   PersistedMessage,
+  PlanInfo,
+  QueryProgress,
+  RenderedVisual,
   Session,
   TableResult,
   TokenUsage,
@@ -31,6 +37,9 @@ import {
  * server-persisted truth is already perfect — duplicating it in
  * localStorage would just create a sync nightmare.
  */
+/** UI theme — 'system' tracks `prefers-color-scheme`. Persisted. */
+export type ThemeChoice = 'dark' | 'light' | 'system'
+
 interface AppStore {
   // ---- Persisted prefs ----------------------------------------------------
   model: string
@@ -38,6 +47,7 @@ interface AppStore {
   activeSessionId: string | null
   activeConversationId: string | null
   sidebarCollapsed: boolean
+  theme: ThemeChoice
 
   // ---- Ephemeral state ----------------------------------------------------
   hydrated: boolean
@@ -58,6 +68,13 @@ interface AppStore {
   setActiveConversation: (id: string | null) => void
   setSidebarCollapsed: (v: boolean) => void
   toggleSidebar: () => void
+  setTheme: (t: ThemeChoice) => void
+  cycleTheme: () => void
+  /** Toggle a connection on (becomes the active session) or off (clears
+   *  the active session if it was the one). Only one connection can be
+   *  "on" at a time — this is the explicit single-select primitive that
+   *  the sidebar's per-connection switch calls. */
+  toggleConnection: (id: string) => void
 
   // ---- Hydration ----------------------------------------------------------
   setHydrated: (h: boolean) => void
@@ -84,6 +101,14 @@ interface AppStore {
   setAnalysisError: (id: string, error: string) => void
   attachServerIds: (id: string, conversationId: string, messageId?: string | null) => void
   setActiveAnalysis: (id: string | null) => void
+
+  // ── Multi-agent setters (Phase 6) ──────────────────────────────────────
+  setIntent:          (id: string, info: IntentInfo) => void
+  setPlanInfo:        (id: string, info: PlanInfo) => void
+  upsertQueryProgress:(id: string, q: QueryProgress) => void
+  addVisual:          (id: string, v: RenderedVisual) => void
+  setInsightReport:   (id: string, r: InsightReport) => void
+  setCritique:        (id: string, r: CritiqueReport) => void
 
   // ---- Stream control -----------------------------------------------------
   setCurrentAbort: (fn: (() => void) | null) => void
@@ -125,6 +150,9 @@ function messagesToAnalyses(messages: PersistedMessage[]): AnalysisResult[] {
       error:           msg.error ?? undefined,
       conversationId:  msg.conversation_id,
       messageId:       msg.id,
+      visuals:         msg.visuals ?? undefined,
+      insightReport:   msg.insight_report ?? undefined,
+      critique:        msg.critique ?? undefined,
     })
   }
   return out
@@ -140,6 +168,7 @@ export const useStore = create<AppStore>()(
       activeSessionId: null,
       activeConversationId: null,
       sidebarCollapsed: false,
+      theme: 'dark',
 
       // ---- Ephemeral defaults ---------------------------------------------
       hydrated: false,
@@ -158,6 +187,19 @@ export const useStore = create<AppStore>()(
       setActiveConversation:  (id) => set({ activeConversationId: id }),
       setSidebarCollapsed:    (v) => set({ sidebarCollapsed: v }),
       toggleSidebar:          () => set((st) => ({ sidebarCollapsed: !st.sidebarCollapsed })),
+
+      setTheme: (theme) => set({ theme }),
+      cycleTheme: () =>
+        set((st) => {
+          const order: ThemeChoice[] = ['dark', 'light', 'system']
+          const next = order[(order.indexOf(st.theme) + 1) % order.length]
+          return { theme: next }
+        }),
+
+      toggleConnection: (id) =>
+        set((st) => ({
+          activeSessionId: st.activeSessionId === id ? null : id,
+        })),
 
       // ---- Hydration ------------------------------------------------------
       setHydrated:      (hydrated) => set({ hydrated }),
@@ -284,6 +326,61 @@ export const useStore = create<AppStore>()(
 
       setActiveAnalysis: (id) => set({ activeAnalysisId: id }),
 
+      // ── Multi-agent setters ────────────────────────────────────────────
+      setIntent: (id, info) =>
+        set((st) => ({
+          analyses: st.analyses.map((a) =>
+            a.id === id ? { ...a, intentInfo: info } : a,
+          ),
+        })),
+
+      setPlanInfo: (id, info) =>
+        set((st) => ({
+          analyses: st.analyses.map((a) =>
+            a.id === id ? { ...a, planInfo: info } : a,
+          ),
+        })),
+
+      upsertQueryProgress: (id, q) =>
+        set((st) => ({
+          analyses: st.analyses.map((a) => {
+            if (a.id !== id) return a
+            const existing = a.queryProgress ?? []
+            const idx = existing.findIndex((x) => x.query_id === q.query_id)
+            const next = idx === -1
+              ? [...existing, q]
+              : existing.map((x, i) => (i === idx ? { ...x, ...q } : x))
+            return { ...a, queryProgress: next }
+          }),
+        })),
+
+      addVisual: (id, v) =>
+        set((st) => ({
+          analyses: st.analyses.map((a) => {
+            if (a.id !== id) return a
+            const existing = a.visuals ?? []
+            const idx = existing.findIndex((x) => x.visual_id === v.visual_id)
+            const next = idx === -1
+              ? [...existing, v]
+              : existing.map((x, i) => (i === idx ? v : x))
+            return { ...a, visuals: next }
+          }),
+        })),
+
+      setInsightReport: (id, r) =>
+        set((st) => ({
+          analyses: st.analyses.map((a) =>
+            a.id === id ? { ...a, insightReport: r } : a,
+          ),
+        })),
+
+      setCritique: (id, r) =>
+        set((st) => ({
+          analyses: st.analyses.map((a) =>
+            a.id === id ? { ...a, critique: r } : a,
+          ),
+        })),
+
       // ---- Stream control --------------------------------------------------
 
       setCurrentAbort: (fn) => set({ currentAbort: fn }),
@@ -379,6 +476,7 @@ export const useStore = create<AppStore>()(
         activeSessionId:      s.activeSessionId,
         activeConversationId: s.activeConversationId,
         sidebarCollapsed:     s.sidebarCollapsed,
+        theme:                s.theme,
       }),
     },
   ),

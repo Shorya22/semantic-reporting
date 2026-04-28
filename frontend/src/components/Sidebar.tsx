@@ -170,7 +170,7 @@ function ConversationRow({ conv }: { conv: Conversation }) {
 // ---------------------------------------------------------------------------
 
 function SessionCard({ session, showTypeBadge }: { session: Session; showTypeBadge: boolean }) {
-  const { activeSessionId, setActiveSession, removeSession } = useStore()
+  const { activeSessionId, toggleConnection, removeSession } = useStore()
   const isActive = session.session_id === activeSessionId
   const meta     = TYPE_META[session.type] ?? TYPE_META.sqlite
   const Icon     = meta.Icon
@@ -181,14 +181,19 @@ function SessionCard({ session, showTypeBadge }: { session: Session; showTypeBad
     removeSession(session.session_id)
   }
 
+  function handleToggle(e: React.MouseEvent | React.KeyboardEvent) {
+    e.stopPropagation()
+    toggleConnection(session.session_id)
+  }
+
   return (
     <div
       role="button"
       tabIndex={0}
-      onClick={() => setActiveSession(session.session_id)}
-      onKeyDown={(e) => e.key === 'Enter' && setActiveSession(session.session_id)}
+      onClick={() => toggleConnection(session.session_id)}
+      onKeyDown={(e) => e.key === 'Enter' && toggleConnection(session.session_id)}
       aria-pressed={isActive}
-      aria-label={isActive ? `Active connection: ${session.name}` : `Switch to ${session.name}`}
+      aria-label={isActive ? `${session.name} is on (active). Press to turn off.` : `${session.name} is off. Press to turn on.`}
       className={`group relative rounded-lg border px-2.5 py-2 cursor-pointer transition-all ${
         isActive
           ? 'bg-indigo-600/10 border-indigo-500/40'
@@ -196,12 +201,20 @@ function SessionCard({ session, showTypeBadge }: { session: Session; showTypeBad
       }`}
     >
       <div className="flex items-center gap-2 min-w-0">
-        <div className={`shrink-0 w-6 h-6 rounded-md flex items-center justify-center ${meta.bg}`}>
+        <div
+          className={`shrink-0 w-6 h-6 rounded-md flex items-center justify-center ${meta.bg} transition-opacity ${
+            isActive ? '' : 'opacity-60'
+          }`}
+        >
           <Icon className={`w-3.5 h-3.5 ${meta.text}`} aria-hidden="true" />
         </div>
 
         <div className="flex-1 min-w-0">
-          <span className={`block text-xs font-medium truncate ${isActive ? 'text-indigo-100' : 'text-slate-200'}`}>
+          <span
+            className={`block text-xs font-medium truncate transition-colors ${
+              isActive ? 'text-indigo-100' : 'text-slate-400'
+            }`}
+          >
             {session.name}
           </span>
           <div className="flex items-center gap-1.5 mt-0.5">
@@ -214,13 +227,18 @@ function SessionCard({ session, showTypeBadge }: { session: Session; showTypeBad
                   className="w-1 h-1 rounded-full bg-emerald-400 shadow-[0_0_4px_rgba(74,222,128,0.7)] animate-pulse"
                   aria-hidden="true"
                 />
-                Connected
+                On
               </span>
-            ) : showTypeBadge ? (
-              <span className={`shrink-0 text-[9px] font-semibold uppercase tracking-wide px-1 py-px rounded ${meta.bg} ${meta.text}`}>
+            ) : (
+              <span className="shrink-0 inline-flex items-center gap-1 text-[9px] font-semibold uppercase tracking-wider px-1.5 py-0.5 rounded bg-slate-800/60 text-slate-500 ring-1 ring-slate-700/40">
+                Off
+              </span>
+            )}
+            {!isActive && showTypeBadge && (
+              <span className={`shrink-0 text-[9px] font-semibold uppercase tracking-wide px-1 py-px rounded ${meta.bg} ${meta.text} opacity-70`}>
                 {meta.label}
               </span>
-            ) : null}
+            )}
             {session.tables && session.tables.length > 0 && (
               <span className="text-[10px] text-slate-500 truncate">
                 {session.tables.length} {session.tables.length === 1 ? 'table' : 'tables'}
@@ -230,15 +248,72 @@ function SessionCard({ session, showTypeBadge }: { session: Session; showTypeBad
           </div>
         </div>
 
-        <button
-          onClick={handleDisconnect}
-          aria-label={`Disconnect ${session.name}`}
-          className="opacity-0 group-hover:opacity-100 focus:opacity-100 p-1 rounded hover:bg-slate-700 text-slate-500 hover:text-slate-300 transition-all focus:outline-none focus:ring-1 focus:ring-indigo-500/50"
-        >
-          <X className="w-3 h-3" aria-hidden="true" />
-        </button>
+        {/* Toggle switch + (hover-revealed) disconnect button */}
+        <div className="flex items-center gap-1 shrink-0">
+          <ToggleSwitch
+            on={isActive}
+            onChange={handleToggle}
+            label={`Turn ${session.name} ${isActive ? 'off' : 'on'}`}
+          />
+          <button
+            onClick={handleDisconnect}
+            aria-label={`Disconnect ${session.name}`}
+            className="opacity-0 group-hover:opacity-100 focus:opacity-100 p-1 rounded hover:bg-slate-700 text-slate-500 hover:text-slate-300 transition-all focus:outline-none focus:ring-1 focus:ring-indigo-500/50"
+          >
+            <X className="w-3 h-3" aria-hidden="true" />
+          </button>
+        </div>
       </div>
     </div>
+  )
+}
+
+
+// ---------------------------------------------------------------------------
+// Tiny iOS-style toggle switch — used per-connection.
+// ---------------------------------------------------------------------------
+
+function ToggleSwitch({
+  on,
+  onChange,
+  label,
+}: {
+  on: boolean
+  onChange: (e: React.MouseEvent | React.KeyboardEvent) => void
+  label: string
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={on}
+      aria-label={label}
+      onClick={onChange}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          onChange(e)
+        }
+      }}
+      className={`
+        relative inline-flex items-center
+        w-7 h-4 rounded-full p-0.5
+        transition-colors
+        focus:outline-none focus:ring-1 focus:ring-indigo-500/40 focus:ring-offset-1 focus:ring-offset-[#080d1a]
+        ${on
+          ? 'bg-gradient-to-r from-indigo-600 to-indigo-500 shadow-inner shadow-indigo-900/40'
+          : 'bg-slate-800 ring-1 ring-slate-700/60'}
+      `}
+    >
+      <span
+        aria-hidden="true"
+        className={`
+          inline-block w-3 h-3 rounded-full bg-white shadow-md
+          transition-transform duration-200
+          ${on ? 'translate-x-3' : 'translate-x-0'}
+        `}
+      />
+    </button>
   )
 }
 

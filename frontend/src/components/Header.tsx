@@ -1,5 +1,5 @@
 import { useEffect, useMemo } from 'react'
-import { BarChart3, ChevronDown, Cloud, Cpu } from 'lucide-react'
+import { BarChart3, ChevronDown, Cloud, Cpu, Sun, Moon, Monitor } from 'lucide-react'
 import { GROQ_MODELS, OLLAMA_FALLBACK_MODELS, LlmProvider } from '../types'
 import { useStore } from '../store'
 import { api } from '../api/client'
@@ -132,8 +132,12 @@ export function Header() {
         </div>
       </div>
 
-      {/* ───────────── Right: Provider + Model ───────────── */}
+      {/* ───────────── Right: Theme + Provider + Model ───────────── */}
       <div className="flex items-center gap-2 shrink-0">
+        <ThemeToggle />
+
+        <span aria-hidden="true" className="hidden sm:block h-7 w-px bg-slate-800/80" />
+
         {/* Provider segmented control (replaces dropdown + redundant badge) */}
         <div
           role="radiogroup"
@@ -207,5 +211,40 @@ export function Header() {
         </div>
       </div>
     </header>
+  )
+}
+
+
+// ---------------------------------------------------------------------------
+// Theme toggle — cycles dark ↔ light ↔ system. Icon swaps to match the
+// current choice; ``useTheme`` (mounted in App.tsx) resolves 'system'.
+// ---------------------------------------------------------------------------
+
+function ThemeToggle() {
+  const theme      = useStore((s) => s.theme)
+  const cycleTheme = useStore((s) => s.cycleTheme)
+
+  const Icon  = theme === 'light' ? Sun : theme === 'dark' ? Moon : Monitor
+  const label = theme === 'light' ? 'Light theme' : theme === 'dark' ? 'Dark theme' : 'System theme'
+  const next  = theme === 'dark' ? 'light' : theme === 'light' ? 'system' : 'dark'
+
+  return (
+    <button
+      type="button"
+      onClick={cycleTheme}
+      aria-label={`Theme: ${label}. Click to switch to ${next}.`}
+      title={`Theme: ${label} · click for ${next}`}
+      className="
+        shrink-0 inline-flex items-center justify-center
+        w-8 h-8 rounded-lg
+        bg-slate-900/80 border border-slate-800/80
+        text-slate-400 hover:text-indigo-300
+        hover:border-indigo-500/40
+        focus:outline-none focus:ring-1 focus:ring-indigo-500/50
+        transition-colors shadow-inner shadow-black/20
+      "
+    >
+      <Icon className="w-3.5 h-3.5" aria-hidden="true" />
+    </button>
   )
 }

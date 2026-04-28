@@ -1,6 +1,7 @@
 import { Clock } from 'lucide-react'
 import { AnalysisResult } from '../types'
 import { useStore } from '../store'
+import { api } from '../api/client'
 import { AgentProgress } from './AgentProgress'
 import { EChartCard } from './EChartCard'
 import { DataTable } from './DataTable'
@@ -35,6 +36,17 @@ function StatusBadge({ status }: { status: AnalysisResult['status'] }) {
   )
 }
 
+function ExportBtn({ label, onClick }: { label: string; onClick: () => void }) {
+  return (
+    <button
+      onClick={onClick}
+      className="px-2.5 py-1 rounded-md border border-slate-700/60 bg-slate-900/60 text-slate-300 hover:border-indigo-500/40 hover:text-indigo-300 transition-colors"
+    >
+      {label}
+    </button>
+  )
+}
+
 export function AnalysisCard({ analysis }: Props) {
   const activeSessionId = useStore((s) => s.activeSessionId)
   const isRunning = analysis.status === 'running'
@@ -51,7 +63,7 @@ export function AnalysisCard({ analysis }: Props) {
             {analysis.question}
           </p>
           <div className="flex items-center gap-2 mt-1.5">
-            <span className="text-xs text-slate-600 flex items-center gap-1">
+            <span className="text-xs text-slate-500 flex items-center gap-1">
               <Clock className="w-3 h-3" aria-hidden="true" />
               {analysis.startedAt.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}
             </span>
@@ -89,12 +101,31 @@ export function AnalysisCard({ analysis }: Props) {
         </div>
       )}
 
-      {/* Streaming AI insight */}
+      {/* Streaming AI insight + usage stats */}
       <InsightPanel
         content={analysis.insight}
         isStreaming={isRunning && analysis.insight.length > 0}
         usage={analysis.usage}
       />
+
+      {/* Export buttons — persist after refresh via exportSql stored in DB */}
+      {analysis.exportSql && analysis.status === 'done' && activeSessionId && (
+        <div className="flex items-center gap-2 text-xs">
+          <span className="text-slate-500">Export:</span>
+          <ExportBtn
+            label="CSV"
+            onClick={() => api.exportCsv(activeSessionId, analysis.exportSql!, analysis.question.slice(0, 40))}
+          />
+          <ExportBtn
+            label="Excel"
+            onClick={() => api.exportExcel(activeSessionId, analysis.exportSql!, analysis.question.slice(0, 40))}
+          />
+          <ExportBtn
+            label="PDF"
+            onClick={() => api.exportPdf(activeSessionId, analysis.exportSql!, analysis.question.slice(0, 40))}
+          />
+        </div>
+      )}
 
       {/* Error state */}
       {analysis.error && (

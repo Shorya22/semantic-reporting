@@ -91,12 +91,40 @@ def session_scope() -> Iterator[Session]:
         session.close()
 
 
+def _migrate_messages_table() -> None:
+    """Additive column migrations for the messages table.
+
+    Uses PRAGMA table_info to pre-check which columns already exist so we
+    only issue ALTER TABLE for missing ones — fully idempotent on every boot.
+    Uses TEXT (SQLite stores JSON as TEXT anyway) to avoid affinity issues.
+    """
+    from sqlalchemy import text  # local import — called after engine is ready
+
+    new_columns = [
+        ("visuals_json",  "TEXT"),
+        ("insight_json",  "TEXT"),
+        ("critique_json", "TEXT"),
+    ]
+    with engine.connect() as conn:
+        # PRAGMA table_info returns one row per column; index 1 is the name.
+        rows = conn.execute(text("PRAGMA table_info(messages)")).fetchall()
+        existing = {row[1] for row in rows}
+
+        for col_name, col_type in new_columns:
+            if col_name not in existing:
+                conn.execute(text(f"ALTER TABLE messages ADD COLUMN {col_name} {col_type}"))
+
+        conn.commit()
+
+
 def init_db() -> None:
     """Create all tables. Called from FastAPI lifespan on startup.
 
     ``create_all`` is idempotent — safe to call on every boot.
+    After table creation, runs additive column migrations for schema evolution.
     """
     # Import models so they register with Base.metadata before create_all.
     from app.db import models  # noqa: F401  (side-effect import)
 
     Base.metadata.create_all(bind=engine)
+    _migrate_messages_table()

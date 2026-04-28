@@ -36,6 +36,13 @@ export function useAnalysis() {
     attachServerIds,
     setActiveConversation,
     upsertConversation,
+    setCurrentAbort,
+    setIntent,
+    setPlanInfo,
+    upsertQueryProgress,
+    addVisual,
+    setInsightReport,
+    setCritique,
   } = useStore()
 
   const runAnalysis = useCallback(
@@ -80,8 +87,18 @@ export function useAnalysis() {
             addStep(id, { type, tool, input, output }),
           onExportCtx: (sql, sid) => setExportCtx(id, sql, sid),
           onUsage: (u) => setUsage(id, u),
+          // ── Multi-agent pipeline events ────────────────────────────
+          onIntent:      (info) => setIntent(id, info),
+          onPlan:        (info) => setPlanInfo(id, info),
+          onQueryStart:  (q)    => upsertQueryProgress(id, q),
+          onQueryDone:   (q)    => upsertQueryProgress(id, q),
+          onViz:         (v)    => addVisual(id, v),
+          onLayout:      (_)    => { /* layout already implied by visuals + planInfo */ },
+          onInsight:     (r)    => setInsightReport(id, r),
+          onCritique:    (r)    => setCritique(id, r),
           onDone: () => {
             finalizeAnalysis(id)
+            setCurrentAbort(null)
             // Re-pull conversations to reflect the new ordering + final title.
             api.listConversations()
               .then((list) => useStore.getState().setConversations(list))
@@ -97,11 +114,15 @@ export function useAnalysis() {
               }))
             }
             setAnalysisError(id, err)
+            setCurrentAbort(null)
           },
         },
         activeConversationId,
       )
 
+      // Expose the cancel function to the rest of the app — the QueryBar's
+      // Stop button and the `/stop` slash command both consume this.
+      setCurrentAbort(cancel)
       return cancel
     },
     [
@@ -122,6 +143,13 @@ export function useAnalysis() {
       attachServerIds,
       setActiveConversation,
       upsertConversation,
+      setCurrentAbort,
+      setIntent,
+      setPlanInfo,
+      upsertQueryProgress,
+      addVisual,
+      setInsightReport,
+      setCritique,
     ],
   )
 

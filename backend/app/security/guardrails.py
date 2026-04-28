@@ -52,6 +52,11 @@ from typing import Final
 
 GuardCategory = str  # "ok" | "empty" | "prompt_injection" | "destructive_intent" | "off_topic"
 
+# Hard upper bound — questions longer than this are almost certainly injection
+# payloads (jailbreaks, context flooding, repeated instructions) rather than
+# genuine data questions.
+_MAX_QUESTION_LEN: Final[int] = 2_000
+
 
 @dataclass(frozen=True)
 class GuardrailDecision:
@@ -77,6 +82,31 @@ class GuardrailDecision:
 # ---------------------------------------------------------------------------
 # Pattern library
 # ---------------------------------------------------------------------------
+
+# Null bytes and C0 control characters (except newline/tab) are never
+# present in a legitimate data question and are classic encoding-trick
+# vectors used to confuse tokenisers or bypass regex.
+_CONTROL_CHARS: Final[re.Pattern[str]] = re.compile(
+    r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]"
+)
+
+# Raw SQL DDL / DML embedded directly in the question text.
+# Someone typing "CREATE TABLE users …" or "DELETE FROM orders" in a
+# question is requesting destructive action regardless of intent phrasing.
+_EMBEDDED_SQL: Final[re.Pattern[str]] = re.compile(
+    r"\b(?:"
+    r"CREATE\s+(?:TABLE|DATABASE|SCHEMA|INDEX|VIEW|TRIGGER|PROCEDURE|FUNCTION|USER)\b"
+    r"|DROP\s+(?:TABLE|DATABASE|SCHEMA|INDEX|VIEW|TRIGGER|PROCEDURE|FUNCTION|USER)\b"
+    r"|ALTER\s+(?:TABLE|DATABASE|SCHEMA|COLUMN)\b"
+    r"|TRUNCATE\s+TABLE\b"
+    r"|INSERT\s+INTO\b"
+    r"|UPDATE\s+\w+\s+SET\b"
+    r"|DELETE\s+FROM\b"
+    r"|GRANT\s+\w+\s+ON\b"
+    r"|REVOKE\s+\w+\s+ON\b"
+    r")",
+    re.IGNORECASE,
+)
 
 # Prompt injection — attempts to override the system role, leak the
 # system prompt, or impersonate the system. Aggressive on purpose.
@@ -116,6 +146,7 @@ _DESTRUCTIVE_INTENT: Final[re.Pattern[str]] = re.compile(
     r"|revoke\s+(?:privileges?|access|permissions?)"
     r"|(?:add|insert|put)\s+(?:a\s+|an\s+)?(?:new\s+)?(?:row|record|entry|user|customer|order|column)\s+(?:to|into|in)"
     r"|(?:modify|change|edit)\s+(?:the\s+|all\s+|my\s+)?(?:table|database|schema|record|row)"
+    r"|(?:remove|nuke|purge|reset|wipe)\s+(?:all\s+|the\s+|every\s+)?(?:data|records?|rows?|table|tables|entries|users?|database)"
     r")\b",
     re.IGNORECASE,
 )
@@ -166,6 +197,12 @@ _DATA_CONTEXT: Final[re.Pattern[str]] = re.compile(
     r"|chart|graph|plot|visuali[sz]e|trend|trends|aggregate|aggregation"
     r"|count|sum|avg|average|mean|median|min|max|total|distinct"
     r"|expense|expenses|revenue|sale|sales|order|orders|customer|customers|product|products|user|users|invoice|invoices"
+    # AUA/KUA, fraud, biometric, fintech, telecom domain terms
+    r"|auth|authentication|aua|kua|transaction|transactions|fraud|fraudulent|fraudster"
+    r"|biometric|fingerprint|iris|face|otp|ekyc|kyc|aadhaar|uidai"
+    r"|partner|partners|device|devices|emulator|rooted|velocity|geo|gps|location"
+    r"|ip\s+address|network|anomaly|anomalies|label|labels|pattern|patterns"
+    r"|subject|hash|channel|mobile|kiosk|sdk|agent|request|response|latency"
     r")\b",
     re.IGNORECASE,
 )
@@ -224,6 +261,30 @@ def validate_question(question: str) -> GuardrailDecision:
         return GuardrailDecision(False, "empty", "empty input", _REFUSAL_EMPTY)
 
     text = question.strip()
+
+    # 0a. Length limit — anything over 2 000 chars is an injection vector.
+    if len(text) > _MAX_QUESTION_LEN:
+        return GuardrailDecision(
+            False, "prompt_injection",
+            f"question length {len(text)} exceeds {_MAX_QUESTION_LEN} char limit",
+            _REFUSAL_PROMPT_INJECTION,
+        )
+
+    # 0b. Control characters — null bytes / C0 control chars are encoding tricks.
+    if _CONTROL_CHARS.search(text):
+        return GuardrailDecision(
+            False, "prompt_injection",
+            "control characters detected in question",
+            _REFUSAL_PROMPT_INJECTION,
+        )
+
+    # 0c. Embedded SQL DDL/DML — raw SQL code typed directly in the question.
+    if _EMBEDDED_SQL.search(text):
+        return GuardrailDecision(
+            False, "destructive_intent",
+            "embedded SQL DDL/DML detected in question text",
+            _REFUSAL_DESTRUCTIVE,
+        )
 
     # 1. Prompt injection — never override.
     if _PROMPT_INJECTION.search(text):

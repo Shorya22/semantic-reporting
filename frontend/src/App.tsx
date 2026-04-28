@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState, useCallback } from 'react'
 import {
   BarChart2, Sparkles, Database, Zap,
   PanelLeftClose, PanelLeftOpen,
@@ -6,10 +6,37 @@ import {
 import { useStore } from './store'
 import { useAnalysis } from './hooks/useAnalysis'
 import { useHydrate, useConversationSync, usePreferenceSync } from './hooks/useHydrate'
+import { useTheme } from './hooks/useTheme'
 import { Header } from './components/Header'
 import { Sidebar } from './components/Sidebar'
 import { QueryBar } from './components/QueryBar'
 import { AnalysisCard } from './components/AnalysisCard'
+import { DashboardCard } from './components/DashboardCard'
+import { api } from './api/client'
+import type { AnalysisResult } from './types'
+
+/**
+ * Decide which renderer to use for one analysis.
+ *
+ * During a live stream: use `intentInfo` (emitted first by the pipeline).
+ * After reload from DB: `intentInfo` is not persisted, so fall back to:
+ *   - `insightReport` present → always a multi-agent pipeline response
+ *   - `visuals.length >= 1` → pipeline produced at least one visual
+ *
+ * Only pure chat-style answers (no insight, no visuals) use `AnalysisCard`.
+ */
+function shouldRenderAsDashboard(a: AnalysisResult): boolean {
+  if (a.intentInfo) {
+    if (a.intentInfo.wants_dashboard) return true
+    if (a.intentInfo.intent === 'report') return true
+    if (a.intentInfo.wants_chart) return true
+  }
+  // Persisted message reload heuristics (intentInfo not saved to DB)
+  if (a.insightReport) return true
+  if ((a.visuals?.length ?? 0) >= 1) return true
+  if ((a.charts?.length ?? 0) >= 1) return true   // old messages: charts_json but no visuals_json
+  return false
+}
 
 function OnboardingScreen() {
   return (
@@ -57,7 +84,54 @@ function OnboardingScreen() {
   )
 }
 
-function WorkspaceEmpty() {
+const FALLBACK_EXAMPLES = [
+  'Show me what tables are available',
+  'How many records are in the database?',
+  'Show me a summary of the data',
+  'Give me a complete analysis overview',
+] as const
+
+interface WorkspaceEmptyProps {
+  activeSessionId: string
+  onExampleClick: (query: string) => void
+}
+
+function WorkspaceEmptySkeleton() {
+  return (
+    <div className="mt-6 grid grid-cols-2 gap-2 max-w-sm w-full" aria-busy="true" aria-label="Loading example queries">
+      {Array.from({ length: 4 }).map((_, i) => (
+        <div
+          key={i}
+          className="h-10 rounded-xl bg-slate-800/50 animate-pulse"
+          aria-hidden="true"
+        />
+      ))}
+    </div>
+  )
+}
+
+function WorkspaceEmpty({ activeSessionId, onExampleClick }: WorkspaceEmptyProps) {
+  const [examples, setExamples] = useState<string[]>([])
+  const [loading, setLoading] = useState(true)
+
+  useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    setExamples([])
+
+    api.fetchExampleQueries(activeSessionId).then((fetched) => {
+      if (cancelled) return
+      setExamples(
+        fetched.length > 0 ? fetched.slice(0, 4) : [...FALLBACK_EXAMPLES],
+      )
+      setLoading(false)
+    })
+
+    return () => {
+      cancelled = true
+    }
+  }, [activeSessionId])
+
   return (
     <div className="flex flex-col items-center justify-center h-full px-6 py-16 text-center select-none">
       <div className="w-14 h-14 rounded-2xl bg-indigo-600/10 border border-indigo-500/20 flex items-center justify-center mb-5">
@@ -68,21 +142,22 @@ function WorkspaceEmpty() {
         Ask anything about your data below. The agent will autonomously query,
         visualize, and surface insights.
       </p>
-      <div className="mt-6 grid grid-cols-2 gap-2 max-w-sm w-full" aria-label="Example queries">
-        {[
-          'Show total revenue by category',
-          'What are the top 10 customers?',
-          'Monthly trend with a chart',
-          'Full performance analysis',
-        ].map((q) => (
-          <div
-            key={q}
-            className="text-left text-xs text-slate-500 bg-slate-900/40 border border-slate-800/60 rounded-xl px-3 py-2.5 leading-relaxed hover:border-slate-700 hover:text-slate-400 transition-colors"
-          >
-            "{q}"
-          </div>
-        ))}
-      </div>
+      {loading ? (
+        <WorkspaceEmptySkeleton />
+      ) : (
+        <div className="mt-6 grid grid-cols-2 gap-2 max-w-sm w-full" aria-label="Example queries">
+          {examples.map((q) => (
+            <button
+              key={q}
+              type="button"
+              onClick={() => onExampleClick(q)}
+              className="text-left text-xs text-slate-500 bg-slate-900/40 border border-slate-800/60 rounded-xl px-3 py-2.5 leading-relaxed hover:border-indigo-500/40 hover:text-slate-300 hover:bg-slate-800/40 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-500/50 focus-visible:ring-offset-1 focus-visible:ring-offset-transparent"
+            >
+              "{q}"
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   )
 }
@@ -93,12 +168,27 @@ export default function App() {
   useHydrate()
   useConversationSync()
   usePreferenceSync()
+  // Apply the persisted dark / light / system theme to <html>.
+  useTheme()
 
   const { activeSessionId, analyses, isQuerying } = useStore()
   const sidebarCollapsed = useStore((s) => s.sidebarCollapsed)
   const toggleSidebar    = useStore((s) => s.toggleSidebar)
   const { runAnalysis } = useAnalysis()
   const bottomRef = useRef<HTMLDivElement>(null)
+
+  // Controlled prefill for QueryBar — set when user clicks an example query.
+  // Cleared immediately after QueryBar consumes it so subsequent clicks on
+  // the same example still trigger the effect.
+  const [prefillValue, setPrefillValue] = useState('')
+
+  const handleExampleClick = useCallback((query: string) => {
+    setPrefillValue(query)
+  }, [])
+
+  const handlePrefillConsumed = useCallback(() => {
+    setPrefillValue('')
+  }, [])
 
   // ⌘B / Ctrl+B toggles the sidebar globally — except when typing in inputs.
   useEffect(() => {
@@ -122,7 +212,7 @@ export default function App() {
   }, [analyses.length])
 
   return (
-    <div className="flex flex-col h-screen overflow-hidden" style={{ background: '#060b18' }}>
+    <div className="flex flex-col h-screen overflow-hidden" style={{ background: 'var(--app-bg)' }}>
       <Header />
 
       <div className="flex flex-1 min-h-0 overflow-hidden relative">
@@ -175,12 +265,19 @@ export default function App() {
           <div className="flex-1 overflow-y-auto min-h-0">
             <div className="max-w-5xl mx-auto px-6 py-6 pb-4 space-y-8">
               {!activeSessionId && <OnboardingScreen />}
-              {activeSessionId && analyses.length === 0 && <WorkspaceEmpty />}
+              {activeSessionId && analyses.length === 0 && (
+                <WorkspaceEmpty
+                  activeSessionId={activeSessionId}
+                  onExampleClick={handleExampleClick}
+                />
+              )}
 
               {analyses.map((analysis, i) => (
                 <div key={analysis.id} className="animate-fadeIn">
                   {i > 0 && <div className="border-t border-slate-800/50 -mx-6 mb-8" aria-hidden="true" />}
-                  <AnalysisCard analysis={analysis} />
+                  {shouldRenderAsDashboard(analysis)
+                    ? <DashboardCard analysis={analysis} />
+                    : <AnalysisCard   analysis={analysis} />}
                 </div>
               ))}
 
@@ -194,6 +291,8 @@ export default function App() {
                 onSubmit={runAnalysis}
                 isQuerying={isQuerying}
                 disabled={!activeSessionId}
+                prefillValue={prefillValue}
+                onPrefillConsumed={handlePrefillConsumed}
               />
             </div>
           </div>

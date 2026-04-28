@@ -236,26 +236,47 @@ def _build_graph(
         - ALWAYS call execute_sql FIRST to verify exact column names, then use those.
 
         CHART TYPE SELECTION GUIDE:
-        "bar"            Category comparisons (default choice for grouped data).
-                         x is categorical, y is numeric.
-        "horizontal_bar" Same as bar but rotated. Best for long category names (>8 chars).
-        "line"           Time-series trends. x should be ordered dates/months/years.
-        "area"           Cumulative trends with fill. Same rules as line.
-        "pie"            Part-to-whole proportions. Use ONLY for ≤8 categories.
-        "donut"          Like pie but with center hole. KPI-style dashboards.
-        "scatter"        Correlation between two numeric columns.
-        "histogram"      Distribution of one numeric column. Only x_col needed.
-        "funnel"         Stage-by-stage reduction (conversion rates, drop-off).
-        "treemap"        Hierarchical proportions for many categories.
-        "gauge"          Single KPI value against a scale. Only y_col needed.
+
+        — Single-series basics —
+        "bar"               Category comparisons (default choice for grouped data).
+                            x = categorical, y = numeric.
+        "horizontal_bar"    Same as bar but rotated. Use for long category names (>8 chars).
+        "line"              Time-series trends. x = ordered dates/months/years, y = numeric.
+        "area"              Like line, with shaded fill. Same rules.
+        "pie" / "donut"     Part-to-whole proportions. Use ONLY for ≤8 categories.
+        "scatter"           Correlation between two numeric columns.
+        "histogram"         Distribution of one numeric column. Only x_col needed.
+        "funnel"            Stage-by-stage reduction (conversion rates, drop-off).
+        "treemap"           Hierarchical proportions for many categories.
+        "gauge"             Single KPI value against a scale. Only y_col needed.
+        "box"               Distribution per category (computes quartiles). x=group, y=numeric.
+        "waterfall"         Sequence of additive deltas (P&L bridge, balance changes).
+                            Bars are coloured green/red based on sign of y.
+
+        — Multi-series (REQUIRES color_col as the series/group dimension) —
+        "stacked_bar"       Stacked categorical comparison. x=group, color=segment, y=value.
+        "stacked_horizontal_bar"  Same, rotated for long labels.
+        "grouped_bar"       Side-by-side bars per category. Same column shape.
+        "stacked_area"      Cumulative trends split by series. x=time, color=series, y=value.
+        "multi_line"        Multiple lines for comparison. Same column shape.
+        "radar"             Multi-axis comparison of entities. x=indicator, color=entity, y=score.
+        "sunburst"          Hierarchical pie. color=parent group, x=child, y=value.
+
+        — 3+ column specialties —
+        "heatmap"           2D matrix. SELECT must return 3 cols: x (cat), y (cat), value (num).
+        "calendar_heatmap"  Daily activity (GitHub-style). 2 cols: date, value.
+        "bubble"            Scatter with size encoding. 3 numeric cols: x, y, size (color_col).
+        "sankey"            Flow diagram. 3 cols: source, target, value.
+        "candlestick"       Financial OHLC. 5 cols in this order: date, open, high, low, close.
 
         Parameters
         ----------
         sql : str
             Complete SELECT statement (same as used in execute_sql).
         chart_type : str
-            One of: bar, horizontal_bar, line, area, pie, donut, scatter,
-            histogram, funnel, treemap, gauge, box.
+            One of the 25 types listed above. When in doubt: "bar" for categories,
+            "line" for time, "stacked_bar" when you have a primary AND secondary
+            grouping dimension, "heatmap" for 2D matrices.
         x_col : str
             MUST exactly match a column alias in the SQL SELECT clause.
             Call execute_sql first if unsure. Do NOT guess column names.
@@ -480,14 +501,29 @@ Answer: There are 1,547 orders in the database.
 ---
 
 ## CHART TYPE GUIDE
-bar            → Category comparisons (x=category, y=numeric)
-horizontal_bar → Long category names (>8 chars)
-line           → Time trends (x=ordered date/month/year)
-area           → Cumulative trends
-pie / donut    → Proportions, ≤8 categories only
-scatter        → Correlation (2 numeric columns)
-treemap        → Many categories, hierarchical size
-funnel         → Stage drop-off (conversion rates)
+Single-series:
+  bar / horizontal_bar  → Category comparisons (rotate when labels are long)
+  line / area           → Time trends with x = ordered date / month / year
+  pie / donut           → Proportions for ≤ 8 categories
+  scatter               → Correlation between two numeric columns
+  histogram             → Distribution of one numeric column
+  funnel                → Stage drop-off (conversion rates)
+  treemap               → Many categories, hierarchical size
+  gauge                 → Single KPI value against a scale
+  box                   → Distribution per category (quartiles)
+  waterfall             → Sequence of deltas (P&L bridge)
+
+Multi-series (require color_col as the series dimension):
+  stacked_bar / stacked_horizontal_bar / grouped_bar
+  stacked_area / multi_line
+  radar / sunburst
+
+3+ column specialties:
+  heatmap          → 3 cols: x (cat), y (cat), value
+  calendar_heatmap → 2 cols: date, value
+  bubble           → 3 numeric: x, y, size (size goes in color_col)
+  sankey           → 3 cols: source, target, value
+  candlestick      → 5 cols in order: date, open, high, low, close
 """
 
     # ── Node: agent ───────────────────────────────────────────────────────────

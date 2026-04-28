@@ -10,28 +10,31 @@ interface Props {
   usage?: TokenUsage
 }
 
+function fmtMs(ms: number): string {
+  return ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(2)} s`
+}
+
 export function InsightPanel({ content, isStreaming, usage }: Props) {
   if (!content && !isStreaming) return null
 
+  // Prefer latency_ms (LangGraph agent), fall back to total_elapsed_ms (multi-agent pipeline)
+  const displayLatency =
+    typeof usage?.latency_ms === 'number' && usage.latency_ms > 0
+      ? usage.latency_ms
+      : typeof usage?.total_elapsed_ms === 'number' && usage.total_elapsed_ms > 0
+        ? usage.total_elapsed_ms
+        : null
+
+  const inTok    = usage?.input_tokens  ?? 0
+  const outTok   = usage?.output_tokens ?? 0
+  const showStrip = !isStreaming && (displayLatency != null || inTok > 0 || outTok > 0)
+
   return (
     <div className="bg-slate-900/80 border border-slate-700/50 rounded-xl px-5 py-4">
-      <div className="flex items-center justify-between mb-3">
+      <div className="flex items-center mb-3">
         <span className="text-xs font-medium text-slate-400 uppercase tracking-wider">
           AI Analysis
         </span>
-        {usage && (
-          <span className="text-xs text-slate-600">
-            ↑{usage.input_tokens.toLocaleString()} ↓{usage.output_tokens.toLocaleString()} tok
-            {typeof usage.latency_ms === 'number' && usage.latency_ms > 0 && (
-              <>
-                {' · '}
-                {usage.latency_ms < 1000
-                  ? `${usage.latency_ms} ms`
-                  : `${(usage.latency_ms / 1000).toFixed(2)} s`}
-              </>
-            )}
-          </span>
-        )}
       </div>
 
       <div
@@ -88,6 +91,26 @@ export function InsightPanel({ content, isStreaming, usage }: Props) {
           />
         )}
       </div>
+
+      {/* Telemetry strip — bottom-right of the panel.
+          Shows latency + input/output tokens explicitly so the user always
+          sees all three numbers (zero counts mean "no LLM was called",
+          which is meaningful for guardrail-blocked runs). */}
+      {showStrip && (
+        <div className="flex justify-end mt-3 pt-3 border-t border-slate-800/60">
+          <span
+            className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-indigo-500/10 text-indigo-300 ring-1 ring-indigo-500/20 text-[11px] font-medium tabular-nums"
+            title={`Total latency: ${displayLatency != null ? fmtMs(displayLatency) : '—'}\nInput tokens: ${inTok.toLocaleString()}\nOutput tokens: ${outTok.toLocaleString()}`}
+          >
+            {displayLatency != null && <span>{fmtMs(displayLatency)}</span>}
+            {displayLatency != null && <span aria-hidden="true" className="opacity-60">·</span>}
+            <span>↑{inTok.toLocaleString()}</span>
+            <span aria-hidden="true" className="opacity-60">·</span>
+            <span>↓{outTok.toLocaleString()}</span>
+            <span className="opacity-60 ml-0.5">tok</span>
+          </span>
+        </div>
+      )}
     </div>
   )
 }
